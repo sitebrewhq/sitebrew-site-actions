@@ -1,0 +1,142 @@
+name: sitebrew-site-actions
+
+# Reusable workflow for a Sitebrew-hosted Hugo site repository, called via
+# `workflow_call` from the site's own `.github/workflows/*.yml` (see README).
+# Scope of this first version: push to `main` only — mints its R2 upload
+# credential through `sitebrew-api`'s Actions OIDC exchange
+# (`POST /v1/actions/upload-token`, ADR-0003 open question 8) and never
+# receives or stores a Cloudflare credential in the caller's own config.
+# PR-preview builds and their `deploy-callback` hostname mapping are a
+# deliberate follow-up (thread 1788253815.206359, 2026-09-01), not part of
+# this file yet.
+
+on:
+  workflow_call:
+    inputs:
+      api-base-url:
+        description: "Base URL of the sitebrew-api stage this run publishes to"
+        type: string
+        default: "https://api-staging.sitebrew.app"
+      oidc-audience:
+        description: "Must match sitebrew-api's ACTIONS_OIDC_AUDIENCE for that stage (sitebrew-actions-<stage>)"
+        type: string
+        default: "sitebrew-actions-staging"
+      hugo-version:
+        type: string
+        default: "0.147.0"
+
+# Every action this workflow calls, SHA-pinned — a `<site-actions>`-calling
+# repository's own `selected actions` allowlist has to name each of these
+# individually (verified live, 2026-09-01: a caller repo's allowlist gates
+# actions used *inside* a called reusable workflow too, not just the
+# workflow file itself), so keeping this set minimal keeps that allowlist
+# minimal.
+jobs:
+  build:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.2.2
+      - name: Install Hugo
+        uses: peaceiris/actions-hugo@2752ce1d29631191ea3f27c23495fa06139a5b78 # v3.0.0
+        with:
+          hugo-version: ${{ inputs.hugo-version }}
+          extended: true
+      - name: Build
+        run: hugo --gc --minify
+      - name: Upload build artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: site
+          path: public
+          retention-days: 1
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # The one thing this job needs that the build job must not have:
+      # GitHub's own short-lived OIDC identity token, traded for an R2
+      # upload credential scoped to exactly this repository's prefix. No
+      # Cloudflare secret is ever configured on this repository or its
+      # caller (design/0005 §8's job split — untrusted `hugo` build stays
+      # in the credential-free `build` job above).
+      id-token: write
+    steps:
+      - name: Download build artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: site
+          path: public
+
+      - name: Request GitHub OIDC token
+        id: oidc
+        env:
+          AUDIENCE: ${{ inputs.oidc-audience }}
+        run: |
+          set -euo pipefail
+          resp=$(curl -sSf -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${AUDIENCE}")
+          token=$(node -e 'process.stdout.write(JSON.parse(require("fs").readFileSync(0,"utf8")).value)' <<<"$resp")
+          echo "::add-mask::${token}"
+          echo "token=${token}" >> "$GITHUB_OUTPUT"
+
+      - name: Mint R2 upload credential
+        id: mint
+        env:
+          API_BASE_URL: ${{ inputs.api-base-url }}
+          OIDC_TOKEN: ${{ steps.oidc.outputs.token }}
+        run: |
+          set -euo pipefail
+          resp=$(curl -sSf -X POST "${API_BASE_URL}/v1/actions/upload-token" \
+            -H "Authorization: Bearer ${OIDC_TOKEN}")
+          node -e '
+            const c = JSON.parse(require("fs").readFileSync(0, "utf8"));
+            for (const k of ["accessKeyId", "secretAccessKey", "sessionToken"]) {
+              console.log(`::add-mask::${c[k]}`);
+            }
+            const out = process.env.GITHUB_OUTPUT;
+            const fs = require("fs");
+            for (const k of ["accessKeyId", "secretAccessKey", "sessionToken", "accountId", "bucket", "prefix"]) {
+              fs.appendFileSync(out, `${k}=${c[k]}\n`);
+            }
+          ' <<<"$resp"
+
+      - name: Resolve this reusable workflow's own repository and ref
+        # `github.workflow_ref` names the ref of the *currently running*
+        # workflow file — for a `workflow_call`, that is this repository's
+        # own pinned ref, not the caller's. Needed to check out
+        # `scripts/upload-to-r2.mjs` at the exact reviewed revision this run
+        # was invoked at, not whatever `main` happens to hold right now.
+        id: self
+        env:
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+        run: |
+          set -euo pipefail
+          repo="${WORKFLOW_REF%%/.github/workflows/*}"
+          ref="${WORKFLOW_REF##*@}"
+          echo "repo=${repo}" >> "$GITHUB_OUTPUT"
+          echo "ref=${ref}" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout sitebrew-site-actions (upload script)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.2.2
+        with:
+          repository: ${{ steps.self.outputs.repo }}
+          ref: ${{ steps.self.outputs.ref }}
+          path: .site-actions
+          sparse-checkout: scripts
+
+      - name: Upload site to R2
+        env:
+          R2_ACCOUNT_ID: ${{ steps.mint.outputs.accountId }}
+          R2_BUCKET: ${{ steps.mint.outputs.bucket }}
+          R2_PREFIX: ${{ steps.mint.outputs.prefix }}
+          R2_ACCESS_KEY_ID: ${{ steps.mint.outputs.accessKeyId }}
+          R2_SECRET_ACCESS_KEY: ${{ steps.mint.outputs.secretAccessKey }}
+          R2_SESSION_TOKEN: ${{ steps.mint.outputs.sessionToken }}
+          SITE_DIR: public
+        run: node .site-actions/scripts/upload-to-r2.mjs
