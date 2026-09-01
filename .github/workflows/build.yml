@@ -2,13 +2,14 @@ name: sitebrew-site-actions
 
 # Reusable workflow for a Sitebrew-hosted Hugo site repository, called via
 # `workflow_call` from the site's own `.github/workflows/*.yml` (see README).
-# Scope of this first version: push to `main` only — mints its R2 upload
-# credential through `sitebrew-api`'s Actions OIDC exchange
-# (`POST /v1/actions/upload-token`, ADR-0003 open question 8) and never
-# receives or stores a Cloudflare credential in the caller's own config.
-# PR-preview builds and their `deploy-callback` hostname mapping are a
-# deliberate follow-up (thread 1788253815.206359, 2026-09-01), not part of
-# this file yet.
+# Mints its R2 upload credential through `sitebrew-api`'s Actions OIDC
+# exchange (`POST /v1/actions/upload-token`, ADR-0003 open question 8) and
+# never receives or stores a Cloudflare credential in the caller's own
+# config. Covers both production (`push` to `main`) and pull-request preview
+# builds — the preview's hostname mapping is recorded and removed through
+# the same exchange's `/deploy-callback` (thread 1788253815.206359,
+# 2026-09-01: reuse this run's own OIDC identity rather than shipping a
+# stored `CF_API_TOKEN` into a customer-triggered workflow a second time).
 
 on:
   workflow_call:
@@ -33,7 +34,7 @@ on:
 # minimal.
 jobs:
   build:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.action != 'closed')
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -66,6 +67,9 @@ jobs:
       # caller (design/0005 §8's job split — untrusted `hugo` build stays
       # in the credential-free `build` job above).
       id-token: write
+      # Only used by "Comment preview URL" below, and only on a pull_request
+      # run — a production push never reaches that step.
+      pull-requests: write
     steps:
       - name: Download build artifact
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
@@ -122,7 +126,7 @@ jobs:
           echo "repo=${repo}" >> "$GITHUB_OUTPUT"
           echo "ref=${ref}" >> "$GITHUB_OUTPUT"
 
-      - name: Checkout sitebrew-site-actions (upload script)
+      - name: Checkout sitebrew-site-actions (scripts)
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.2.2
         with:
           repository: ${{ steps.self.outputs.repo }}
@@ -140,3 +144,131 @@ jobs:
           R2_SESSION_TOKEN: ${{ steps.mint.outputs.sessionToken }}
           SITE_DIR: public
         run: node .site-actions/scripts/upload-to-r2.mjs
+
+      # Production resolves its hostname through `sitebrew-worker`'s own
+      # `hostMetadata` (custom hostname) — no KV involved, so this and the
+      # comment step below only run for a pull-request preview.
+      - name: Record preview hostname
+        id: preview
+        if: github.event_name == 'pull_request'
+        env:
+          API_BASE_URL: ${{ inputs.api-base-url }}
+          OIDC_TOKEN: ${{ steps.oidc.outputs.token }}
+        run: |
+          set -euo pipefail
+          resp=$(curl -sSf -X POST "${API_BASE_URL}/v1/actions/deploy-callback" \
+            -H "Authorization: Bearer ${OIDC_TOKEN}")
+          node -e '
+            const c = JSON.parse(require("fs").readFileSync(0, "utf8"));
+            require("fs").appendFileSync(process.env.GITHUB_OUTPUT, `hostname=${c.hostname}\n`);
+          ' <<<"$resp"
+
+      - name: Comment preview URL
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        with:
+          script: |
+            const host = "${{ steps.preview.outputs.hostname }}";
+            const marker = "<!-- sitebrew-preview -->";
+            const body = `${marker}\n🌐 **Sitebrew preview:** https://${host}/`;
+            const { data: comments } = await github.rest.issues.listComments({ ...context.repo, issue_number: context.issue.number });
+            const existing = comments.find((c) => c.body.includes(marker));
+            if (existing) await github.rest.issues.updateComment({ ...context.repo, comment_id: existing.id, body });
+            else await github.rest.issues.createComment({ ...context.repo, issue_number: context.issue.number, body });
+
+  # A pull-request preview's R2 content is always exactly the last
+  # successful `deploy` job's Hugo build output — nothing else is ever
+  # written under its prefix — so this rebuilds the closed PR's last commit
+  # and deletes the resulting file list, rather than adding a second
+  # (query-string) SigV4 signing path just to list what's there first. See
+  # `scripts/delete-from-r2.mjs`'s own module doc.
+  cleanup:
+    if: github.event_name == 'pull_request' && github.event.action == 'closed'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout PR head
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.2.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+      - name: Install Hugo
+        uses: peaceiris/actions-hugo@2752ce1d29631191ea3f27c23495fa06139a5b78 # v3.0.0
+        with:
+          hugo-version: ${{ inputs.hugo-version }}
+          extended: true
+      - name: Build
+        run: hugo --gc --minify
+
+      - name: Request GitHub OIDC token
+        id: oidc
+        env:
+          AUDIENCE: ${{ inputs.oidc-audience }}
+        run: |
+          set -euo pipefail
+          resp=$(curl -sSf -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${AUDIENCE}")
+          token=$(node -e 'process.stdout.write(JSON.parse(require("fs").readFileSync(0,"utf8")).value)' <<<"$resp")
+          echo "::add-mask::${token}"
+          echo "token=${token}" >> "$GITHUB_OUTPUT"
+
+      - name: Mint R2 delete credential
+        id: mint
+        env:
+          API_BASE_URL: ${{ inputs.api-base-url }}
+          OIDC_TOKEN: ${{ steps.oidc.outputs.token }}
+        run: |
+          set -euo pipefail
+          resp=$(curl -sSf -X POST "${API_BASE_URL}/v1/actions/upload-token" \
+            -H "Authorization: Bearer ${OIDC_TOKEN}")
+          node -e '
+            const c = JSON.parse(require("fs").readFileSync(0, "utf8"));
+            for (const k of ["accessKeyId", "secretAccessKey", "sessionToken"]) {
+              console.log(`::add-mask::${c[k]}`);
+            }
+            const out = process.env.GITHUB_OUTPUT;
+            const fs = require("fs");
+            for (const k of ["accessKeyId", "secretAccessKey", "sessionToken", "accountId", "bucket", "prefix"]) {
+              fs.appendFileSync(out, `${k}=${c[k]}\n`);
+            }
+          ' <<<"$resp"
+
+      - name: Resolve this reusable workflow's own repository and ref
+        id: self
+        env:
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+        run: |
+          set -euo pipefail
+          repo="${WORKFLOW_REF%%/.github/workflows/*}"
+          ref="${WORKFLOW_REF##*@}"
+          echo "repo=${repo}" >> "$GITHUB_OUTPUT"
+          echo "ref=${ref}" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout sitebrew-site-actions (scripts)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.2.2
+        with:
+          repository: ${{ steps.self.outputs.repo }}
+          ref: ${{ steps.self.outputs.ref }}
+          path: .site-actions
+          sparse-checkout: scripts
+
+      - name: Delete preview from R2
+        env:
+          R2_ACCOUNT_ID: ${{ steps.mint.outputs.accountId }}
+          R2_BUCKET: ${{ steps.mint.outputs.bucket }}
+          R2_PREFIX: ${{ steps.mint.outputs.prefix }}
+          R2_ACCESS_KEY_ID: ${{ steps.mint.outputs.accessKeyId }}
+          R2_SECRET_ACCESS_KEY: ${{ steps.mint.outputs.secretAccessKey }}
+          R2_SESSION_TOKEN: ${{ steps.mint.outputs.sessionToken }}
+          SITE_DIR: public
+        run: node .site-actions/scripts/delete-from-r2.mjs
+
+      - name: Remove preview hostname
+        env:
+          API_BASE_URL: ${{ inputs.api-base-url }}
+          OIDC_TOKEN: ${{ steps.oidc.outputs.token }}
+        run: |
+          set -euo pipefail
+          curl -sSf -X DELETE "${API_BASE_URL}/v1/actions/deploy-callback" \
+            -H "Authorization: Bearer ${OIDC_TOKEN}" >/dev/null
