@@ -34,7 +34,7 @@ on:
 # minimal.
 jobs:
   build:
-    if: github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.action != 'closed')
+    if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'pull_request' && github.event.action != 'closed')
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -111,14 +111,17 @@ jobs:
           ' <<<"$resp"
 
       - name: Resolve this reusable workflow's own repository and ref
-        # `github.workflow_ref` names the ref of the *currently running*
-        # workflow file — for a `workflow_call`, that is this repository's
-        # own pinned ref, not the caller's. Needed to check out
+        # `github.job_workflow_ref` (not `github.workflow_ref`, which names
+        # the CALLER's own workflow file even inside a called job — verified
+        # live 2026-09-01: using `workflow_ref` here resolved to the calling
+        # site repo, checked it out instead of `sitebrew-site-actions`, and
+        # failed with MODULE_NOT_FOUND since the caller has no `scripts/`)
+        # is this repository's own pinned ref. Needed to check out
         # `scripts/upload-to-r2.mjs` at the exact reviewed revision this run
         # was invoked at, not whatever `main` happens to hold right now.
         id: self
         env:
-          WORKFLOW_REF: ${{ github.workflow_ref }}
+          WORKFLOW_REF: ${{ github.job_workflow_ref }}
         run: |
           set -euo pipefail
           repo="${WORKFLOW_REF%%/.github/workflows/*}"
