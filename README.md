@@ -17,20 +17,28 @@ on:
 
 permissions:
   contents: read
+  id-token: write
+  pull-requests: write
 
 jobs:
   deploy:
     uses: sitebrewhq/sitebrew-site-actions/.github/workflows/build.yml@<pinned-sha>
 ```
 
+All three matter even for a push-only caller: `id-token: write` is required
+by `deploy` on every run (it mints the OIDC token), and `pull-requests: write`
+is required because `deploy` requests it unconditionally for its PR-comment
+step — a called job's `permissions:` block can't request more than the
+caller grants, regardless of that step's own runtime `if:` condition
+(verified live 2026-09-01: omitting either produced a silent `startup_failure`
+with no useful log, not a permission-denied error on the specific step).
+
 The caller's own repository must have its **selected actions** allowlist
 include this workflow *and* every action it calls internally (`actions/checkout`,
 `peaceiris/actions-hugo`, `actions/upload-artifact`, `actions/download-artifact`,
 `actions/github-script` — verified live 2026-09-01 that GitHub's allowlist
 gates actions used inside a called reusable workflow too, not just the
-workflow file itself). The caller also needs `pull-requests: write` in its own
-top-level `permissions:` if it triggers on `pull_request` (preview builds post
-a comment with the preview URL).
+workflow file itself).
 
 ## How it authenticates
 
