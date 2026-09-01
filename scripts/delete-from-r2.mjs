@@ -7,12 +7,15 @@
  *
  * Deliberately **not** a `ListObjectsV2` + delete-what's-there approach: that
  * needs SigV4's query-string canonicalization (a second, more complex
- * signing path) for a case this script does not need it for. A pull-request
- * preview's R2 content is always exactly last successful deploy's Hugo
- * build output — nothing else is ever written under its prefix — so
- * rebuilding that same commit and deleting the resulting file list is byte-
- * for-byte the same key set `ListObjectsV2` would answer, without a second
- * signing path or the extra round trip. Kept as its own file rather than
+ * signing path), and rebuilding the closed PR's last commit and deleting
+ * that file list covers the common case without it. This is not exactly
+ * equivalent to `ListObjectsV2`, though: `upload-to-r2.mjs` is purely
+ * additive across a PR's pushes, so a file removed from the site content
+ * between two pushes (present in an earlier build, gone from the last one)
+ * stays in R2 after cleanup — only the last commit's key set gets deleted.
+ * Accepted as a storage-only gap (the KV hostname mapping is removed in the
+ * same job regardless, so nothing ever points at the orphaned key again),
+ * not a correctness or security issue. Kept as its own file rather than
  * added to `upload-to-r2.mjs` so that script's frozen reference-signature
  * test (`upload-to-r2.test.mjs`) stays untouched by an unrelated change.
  */
