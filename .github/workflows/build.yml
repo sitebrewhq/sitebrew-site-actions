@@ -145,6 +145,7 @@ jobs:
           sparse-checkout: scripts
 
       - name: Upload site to R2
+        id: upload
         env:
           R2_ACCOUNT_ID: ${{ steps.mint.outputs.accountId }}
           R2_BUCKET: ${{ steps.mint.outputs.bucket }}
@@ -154,6 +155,43 @@ jobs:
           R2_SESSION_TOKEN: ${{ steps.mint.outputs.sessionToken }}
           SITE_DIR: public
         run: node .site-actions/scripts/upload-to-r2.mjs
+
+      # Closes the `publishJob` row `publishChange` opened for this run
+      # (`publish-job-status-fix`, 2026-09-02, MEM-475) — without this,
+      # `get_job`/`get_site` read that row stuck at "queued" forever, because
+      # the only prior writer (`PublishJobWorkflow`, the container-based
+      # `design/0005` path) never runs on this Actions/R2 path. `if: always()`
+      # so a failed build/mint/upload is reported too, not only a success —
+      # otherwise a failure leaves the exact same stuck-forever row this step
+      # exists to close. Never fails the job itself: `public/` already landed
+      # in R2 or it didn't by the time this runs, and a callback hiccup must
+      # not flip that verdict. Production only — a pull-request preview has no
+      # `publishJob` row (see `sitebrew-api`'s `actions-oidc-routes.ts` top
+      # note for why `/publish-callback` stays separate from
+      # `/deploy-callback` below).
+      - name: Report publish result
+        if: always() && github.event_name == 'push'
+        env:
+          API_BASE_URL: ${{ inputs.api-base-url }}
+          OIDC_TOKEN: ${{ steps.oidc.outputs.token }}
+          UPLOAD_OUTCOME: ${{ steps.upload.outcome }}
+        run: |
+          if [ -z "${OIDC_TOKEN}" ]; then
+            echo "::warning::No OIDC token minted — cannot report publish result"
+            exit 0
+          fi
+          if [ "${UPLOAD_OUTCOME}" = "success" ]; then
+            body='{"ok": true}'
+          else
+            body='{"ok": false, "explanation": "the Actions run failed before or during the R2 upload", "causedBy": "us"}'
+          fi
+          status=$(curl -sS -o /tmp/publish-callback-response.json -w '%{http_code}' -X POST "${API_BASE_URL}/v1/actions/publish-callback" \
+            -H "Authorization: Bearer ${OIDC_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "${body}")
+          if [ "${status}" -ge 300 ]; then
+            echo "::warning::publish-callback returned HTTP ${status}: $(cat /tmp/publish-callback-response.json)"
+          fi
 
       # Production resolves its hostname through `sitebrew-worker`'s own
       # `hostMetadata` (custom hostname) — no KV involved, so this and the
