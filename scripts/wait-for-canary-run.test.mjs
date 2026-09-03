@@ -1,70 +1,51 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { evaluateWorkflowRuns, waitForCandidateRun } from "./wait-for-canary-run.mjs";
+import { waitForCandidateStatus } from "./wait-for-canary-run.mjs";
 
-test("evaluateWorkflowRuns: not done when no workflow run has started yet", () => {
-  assert.deepEqual(evaluateWorkflowRuns([]), { done: false });
-});
-
-test("evaluateWorkflowRuns: not done while any workflow run is still in progress", () => {
-  assert.deepEqual(
-    evaluateWorkflowRuns([
-      { status: "completed", conclusion: "success" },
-      { status: "in_progress", conclusion: null },
-    ]),
-    { done: false },
-  );
-});
-
-test("evaluateWorkflowRuns: success once every workflow run is completed and successful", () => {
-  assert.deepEqual(
-    evaluateWorkflowRuns([{ status: "completed", conclusion: "success" }]),
-    { done: true, conclusion: "success" },
-  );
-});
-
-test("evaluateWorkflowRuns: failure if any completed workflow run did not conclude success", () => {
-  assert.deepEqual(
-    evaluateWorkflowRuns([
-      { status: "completed", conclusion: "success" },
-      { status: "completed", conclusion: "failure" },
-    ]),
-    { done: true, conclusion: "failure" },
-  );
-});
-
-test("waitForCandidateRun resolves success as soon as a terminal state appears, without over-polling", async () => {
+const fakeMintToken = (tokens = ["t1", "t2", "t3", "t4", "t5"]) => {
   let calls = 0;
+  return { mintToken: async () => tokens[Math.min(calls++, tokens.length - 1)], get calls() { return calls; } };
+};
+
+test("waitForCandidateStatus resolves success as soon as a terminal state appears, minting a fresh token each attempt", async () => {
+  const mint = fakeMintToken();
+  let fetchCalls = 0;
   const sleeps = [];
-  const conclusion = await waitForCandidateRun({
-    repo: "sitebrewhq/sitebrew-canary-site",
+  const conclusion = await waitForCandidateStatus({
+    apiBaseUrl: "https://api-staging.sitebrew.app",
+    audience: "sitebrew-actions-staging",
     sha: "cafef00d",
-    token: "t",
     maxAttempts: 5,
+    mintToken: mint.mintToken,
     fetchImpl: async (url, init) => {
-      calls += 1;
-      assert.equal(url, "https://api.github.com/repos/sitebrewhq/sitebrew-canary-site/actions/runs?head_sha=cafef00d");
-      assert.equal(init.headers.authorization, "Bearer t");
-      const workflow_runs = calls < 2 ? [] : [{ status: "completed", conclusion: "success" }];
-      return { ok: true, json: async () => ({ workflow_runs }) };
+      fetchCalls += 1;
+      assert.equal(url, "https://api-staging.sitebrew.app/v1/actions/canary-status");
+      assert.equal(init.method, "POST");
+      assert.equal(init.headers.authorization, `Bearer t${fetchCalls}`);
+      assert.deepEqual(JSON.parse(init.body), { sha: "cafef00d" });
+      const conclusion = fetchCalls < 2 ? "pending" : "success";
+      return { ok: true, json: async () => ({ conclusion }) };
     },
     sleepImpl: async (ms) => sleeps.push(ms),
   });
   assert.equal(conclusion, "success");
-  assert.equal(calls, 2);
+  assert.equal(fetchCalls, 2);
+  assert.equal(mint.calls, 2, "a fresh token must be minted for every attempt, not reused");
   assert.deepEqual(sleeps, [15000]);
 });
 
-test("waitForCandidateRun reports failure without waiting out the rest of maxAttempts", async () => {
+test("waitForCandidateStatus reports failure without waiting out the rest of maxAttempts", async () => {
+  const mint = fakeMintToken();
   let calls = 0;
-  const conclusion = await waitForCandidateRun({
-    repo: "r",
+  const conclusion = await waitForCandidateStatus({
+    apiBaseUrl: "https://api-staging.sitebrew.app",
+    audience: "a",
     sha: "s",
-    token: "t",
     maxAttempts: 10,
+    mintToken: mint.mintToken,
     fetchImpl: async () => {
       calls += 1;
-      return { ok: true, json: async () => ({ workflow_runs: [{ status: "completed", conclusion: "failure" }] }) };
+      return { ok: true, json: async () => ({ conclusion: "failure" }) };
     },
     sleepImpl: async () => {
       throw new Error("should not sleep once a terminal conclusion is known");
@@ -74,17 +55,19 @@ test("waitForCandidateRun reports failure without waiting out the rest of maxAtt
   assert.equal(calls, 1);
 });
 
-test("waitForCandidateRun gives up and reports timeout after maxAttempts, sleeping between but not after the last attempt", async () => {
+test("waitForCandidateStatus gives up and reports timeout after maxAttempts, sleeping between but not after the last attempt", async () => {
+  const mint = fakeMintToken();
   let sleepCount = 0;
   let fetchCount = 0;
-  const conclusion = await waitForCandidateRun({
-    repo: "r",
+  const conclusion = await waitForCandidateStatus({
+    apiBaseUrl: "https://api-staging.sitebrew.app",
+    audience: "a",
     sha: "s",
-    token: "t",
     maxAttempts: 3,
+    mintToken: mint.mintToken,
     fetchImpl: async () => {
       fetchCount += 1;
-      return { ok: true, json: async () => ({ workflow_runs: [] }) };
+      return { ok: true, json: async () => ({ conclusion: "pending" }) };
     },
     sleepImpl: async () => {
       sleepCount += 1;
@@ -95,14 +78,16 @@ test("waitForCandidateRun gives up and reports timeout after maxAttempts, sleepi
   assert.equal(sleepCount, 2);
 });
 
-test("waitForCandidateRun throws on a non-ok response instead of treating it as pending", async () => {
+test("waitForCandidateStatus throws on a non-ok response instead of treating it as pending", async () => {
+  const mint = fakeMintToken();
   await assert.rejects(
-    waitForCandidateRun({
-      repo: "r",
+    waitForCandidateStatus({
+      apiBaseUrl: "https://api-staging.sitebrew.app",
+      audience: "a",
       sha: "s",
-      token: "t",
-      fetchImpl: async () => ({ ok: false, status: 403, text: async () => "missing actions:read permission" }),
+      mintToken: mint.mintToken,
+      fetchImpl: async () => ({ ok: false, status: 502, text: async () => "GitHub answered 500" }),
     }),
-    /403/,
+    /502/,
   );
 });

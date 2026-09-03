@@ -32,6 +32,14 @@ name: promote
 # empty commit touch neither `.github/workflows/` nor any cross-repo
 # credential beyond what `/canary-token` already mints.
 #
+# The result of that build is read through `sitebrew-api`'s own
+# `/v1/actions/canary-status` (below), not by this workflow calling GitHub's
+# Actions API directly — the same guard above forbids `actions` on an
+# executor-minted token exactly as it forbids `workflows`, confirmed live
+# (a real promotion 403'd before this door existed). `canary-status` runs
+# that GitHub call server-side, on the app's own installation credential,
+# and hands back only a `pending`/`success`/`failure` verdict.
+#
 # Unlike `build.yml`, this workflow runs directly in its own repository via
 # `on: push` rather than being called via `workflow_call` from elsewhere —
 # so a plain `actions/checkout` already gives it exactly the commit that
@@ -155,13 +163,17 @@ jobs:
       # CANARY repo, not `github.sha` (which names a commit in THIS repo) —
       # polling anything else, including "the PR's current head", is
       # exactly the race described in this workflow's own `concurrency`
-      # comment above. Reads the Actions API (workflow runs), not the Checks
-      # API — see `wait-for-canary-run.mjs`'s own doc for why (no `checks:
-      # read` grant needed).
+      # comment above. Reads `sitebrew-api`'s own `/v1/actions/canary-status`,
+      # not GitHub directly — an executor-minted token (`steps.mint`'s own
+      # `/canary-token`, above) can never carry `actions: read`, the same
+      # guard that already forbids `workflows` (see `wait-for-canary-run.mjs`'s
+      # own doc). No `GH_TOKEN` here: the script mints its own fresh OIDC
+      # token per poll attempt from `id-token: write`'s ambient
+      # `ACTIONS_ID_TOKEN_REQUEST_*` env vars, the same identity
+      # `/canary-token` above verified.
       - name: Wait for the candidate's own workflow run
         id: wait
         env:
-          GH_TOKEN: ${{ steps.mint.outputs.token }}
           CANDIDATE_SHA: ${{ steps.candidate.outputs.sha }}
         run: node scripts/wait-for-canary-run.mjs
 
