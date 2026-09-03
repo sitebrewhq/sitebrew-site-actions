@@ -1,0 +1,168 @@
+name: promote
+
+# Moves the `stable` git tag to a new `main` commit only after that exact
+# commit clears a real build+deploy against `sitebrew-canary-site`, a
+# dedicated internal site repo that exists only to run this smoke test
+# (design/0006, sitebrewhq/sitebrew-api). Site repos reference this
+# repository's reusable `build.yml` via `@stable`, never a literal ref of
+# their own choosing, so a commit here only ever reaches a live site once
+# this workflow has said so.
+#
+# GitHub requires a reusable workflow's `uses:` to be a static string — it
+# cannot be parameterized by a dispatch input or an expression (`build.yml`'s
+# own "Resolve this reusable workflow's own repository and ref" step ran
+# into the same constraint from the other side, 2026-09-01). So promotion
+# works by editing a real file: force-push a standing branch on the canary
+# repo whose own `build.yml` calls this exact candidate SHA, open a PR
+# (which is what actually runs the reusable workflow's `pull_request` job —
+# the real production code path, not a simulation of it), and read that
+# run's own result back before moving anything here.
+#
+# Unlike `build.yml`, this workflow runs directly in its own repository via
+# `on: push` rather than being called via `workflow_call` from elsewhere —
+# so a plain `actions/checkout` already gives it exactly the commit that
+# triggered this run (`github.sha`), with none of `build.yml`'s
+# `job_workflow_ref`-decoding dance needed to find its own ref.
+#
+# `sitebrew-canary-site` does not exist yet as of this workflow's addition —
+# registering it as a real `site` row is a later operational step
+# (design/0006, "Rollout order" step 4). Until then, every push to `main`
+# fails at "Mint canary repository token" or the canary checkout just below
+# it — the same loud failure this workflow gives any other broken
+# promotion, and `stable` correctly stays exactly where it is.
+on:
+  push:
+    branches: [main]
+
+# Two pushes to main in quick succession must queue through the shared
+# `canary/promote` branch/PR one at a time, not interleave on it — the other
+# half of the fix for the race DevGuru flagged reviewing design/0006
+# (2026-09-03): a poll that read "the PR's current state" instead of its own
+# exact pushed SHA could promote `stable` to a commit that was never
+# actually validated by the check it read. `cancel-in-progress: false`
+# queues rather than cancels — a cancelled promotion must not silently look
+# like "nothing to do here"; every push still gets its own real answer. See
+# `scripts/wait-for-canary-check.mjs`'s own doc for the SHA-scoped half of
+# this fix.
+concurrency:
+  group: site-actions-promote
+  cancel-in-progress: false
+
+env:
+  API_BASE_URL: https://api-staging.sitebrew.app
+  # Must match sitebrew-api's ACTIONS_OIDC_AUDIENCE for that stage — the
+  # same value `build.yml`'s own `oidc-audience` input defaults to.
+  # `/canary-token` verifies this token against the *same* audience
+  # `/upload-token` does (sitebrew-api#131); what tells the two doors apart
+  # is the claimed `job_workflow_ref` (`authorizeCanaryPromotionRun`), not a
+  # separate audience string.
+  OIDC_AUDIENCE: sitebrew-actions-staging
+  CANARY_REPO: sitebrewhq/sitebrew-canary-site
+  CANARY_DIR: canary
+  CANARY_BRANCH: canary/promote
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+    permissions:
+      # To force-move this repository's own `stable` tag on success, with
+      # the default `GITHUB_TOKEN` — no cross-repo credential needed for a
+      # ref on this same repo.
+      contents: write
+      # To request the OIDC identity token traded below for an installation
+      # token scoped to `sitebrew-canary-site` alone. This job never holds a
+      # credential for the canary repo beyond that minted, short-lived token.
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.2.2
+
+      - name: Request GitHub OIDC token
+        id: oidc
+        env:
+          AUDIENCE: ${{ env.OIDC_AUDIENCE }}
+        run: |
+          set -euo pipefail
+          resp=$(curl -sSf -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${AUDIENCE}")
+          token=$(node -e 'process.stdout.write(JSON.parse(require("fs").readFileSync(0,"utf8")).value)' <<<"$resp")
+          echo "::add-mask::${token}"
+          echo "token=${token}" >> "$GITHUB_OUTPUT"
+
+      - name: Mint canary repository token
+        id: mint
+        env:
+          OIDC_TOKEN: ${{ steps.oidc.outputs.token }}
+        run: |
+          set -euo pipefail
+          resp=$(curl -sSf -X POST "${API_BASE_URL}/v1/actions/canary-token" \
+            -H "Authorization: Bearer ${OIDC_TOKEN}")
+          token=$(node -e 'process.stdout.write(JSON.parse(require("fs").readFileSync(0,"utf8")).token)' <<<"$resp")
+          echo "::add-mask::${token}"
+          echo "token=${token}" >> "$GITHUB_OUTPUT"
+
+      # Fresh every run — a stale local `canary/promote` from a previous
+      # execution is never in play. `scripts/promote-canary-branch.mjs`
+      # resets `canary/promote` from this checkout's `main` unconditionally
+      # (see its own doc: canary's `main` always calls `@stable`, and
+      # `canary/promote` is overwritten every promotion).
+      - name: Checkout sitebrew-canary-site
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.2.2
+        with:
+          repository: ${{ env.CANARY_REPO }}
+          ref: main
+          token: ${{ steps.mint.outputs.token }}
+          path: ${{ env.CANARY_DIR }}
+
+      - name: Point canary at this candidate commit
+        id: candidate
+        env:
+          CANDIDATE_SHA: ${{ github.sha }}
+        run: node scripts/promote-canary-branch.mjs
+
+      # Reuses the already-implemented, already-tested PR-preview path
+      # (`build.yml`'s own `pull_request` job) as the smoke test itself — a
+      # push alone would only run the `push`-triggered job, not the same
+      # code path a real site's pull-request preview exercises. `gh` reads
+      # `GH_TOKEN` for both calls; `--head`/`--base` are enough to detect an
+      # already-open PR, and pushing new commits onto its branch (above)
+      # already makes GitHub re-run checks against the new head — no
+      # separate "update" call is needed once the PR exists.
+      - name: Open the standing canary PR if it isn't already open
+        env:
+          GH_TOKEN: ${{ steps.mint.outputs.token }}
+        run: |
+          set -euo pipefail
+          existing=$(gh pr list --repo "${CANARY_REPO}" --head "${CANARY_BRANCH}" --base main --state open --json number --jq '.[0].number // empty')
+          if [ -z "${existing}" ]; then
+            gh pr create --repo "${CANARY_REPO}" --head "${CANARY_BRANCH}" --base main \
+              --title "canary: promotion smoke test (standing)" \
+              --body "Force-pushed by sitebrew-site-actions' promote.yml on every push to its main — never merge this. It validates one candidate commit before that commit becomes @stable for every live site."
+          fi
+
+      # `steps.candidate.outputs.sha` is this run's OWN pushed commit on the
+      # CANARY repo, not `github.sha` (which names a commit in THIS repo) —
+      # polling anything else, including "the PR's current head", is
+      # exactly the race described in this workflow's own `concurrency`
+      # comment above.
+      - name: Wait for the candidate's own check run
+        id: wait
+        env:
+          GH_TOKEN: ${{ steps.mint.outputs.token }}
+          CANDIDATE_SHA: ${{ steps.candidate.outputs.sha }}
+        run: node scripts/wait-for-canary-check.mjs
+
+      - name: Promote stable
+        if: steps.wait.outputs.conclusion == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api -X PATCH "repos/${{ github.repository }}/git/refs/tags/stable" -f sha="${{ github.sha }}" -F force=true
+          echo "Promoted stable -> ${{ github.sha }}"
+
+      - name: Fail loudly if the candidate did not pass
+        if: steps.wait.outputs.conclusion != 'success'
+        run: |
+          echo "::error::Candidate ${{ github.sha }} (canary commit ${{ steps.candidate.outputs.sha }}) did not clear the canary check — stable stays where it was. Conclusion: ${{ steps.wait.outputs.conclusion }}. The fallback is the same as before this workflow existed: repin the affected site repo(s) by hand."
+          exit 1

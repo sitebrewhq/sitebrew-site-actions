@@ -78,6 +78,29 @@ and a list-then-delete flow would need a second, query-string SigV4 signing
 path for no gain over rebuilding the same commit. It then calls
 `DELETE <api-base-url>/v1/actions/deploy-callback` to remove the KV mapping.
 
+## The `stable` tag and `promote.yml`
+
+Site repos should reference this reusable workflow via
+`@refs/tags/stable`, not a literal SHA of their own choosing (`sitebrew-site-bootstrap`'s
+template does this for every new fork). `stable` only ever advances after
+`.github/workflows/promote.yml` — triggered on every push to this repo's own
+`main` — validates that exact commit against a dedicated, permanent,
+non-customer site repo, `sitebrewhq/sitebrew-canary-site`: force-push a
+standing `canary/promote` branch there whose own `build.yml` is rewritten to
+call the candidate commit (GitHub requires a reusable workflow's `uses:` to
+be a static string, so this is a real file edit, not a parameterized call),
+open a PR against it (which is what actually runs the candidate through the
+real `pull_request` job above), poll that exact pushed commit's own
+check-runs, and only then force-move `stable`. See
+`sitebrewhq/sitebrew-api`'s `design/0006-site-actions-stable-tag.md` for the
+full design, including the race a concurrent push could otherwise cause and
+how `promote.yml`'s `concurrency` block plus `scripts/wait-for-canary-check.mjs`'s
+SHA-scoped poll close it.
+
+A broken `promote.yml` fails loudly and leaves `stable` untouched — the
+fallback is the same manual repin every site repo used before this
+mechanism existed.
+
 ## Testing
 
 ```
