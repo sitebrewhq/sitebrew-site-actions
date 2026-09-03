@@ -91,11 +91,13 @@ call the candidate commit (GitHub requires a reusable workflow's `uses:` to
 be a static string, so this is a real file edit, not a parameterized call),
 open a PR against it (which is what actually runs the candidate through the
 real `pull_request` job above), poll that exact pushed commit's own
-check-runs, and only then force-move `stable`. See
+workflow run, and only then force-move `stable`. See
 `sitebrewhq/sitebrew-api`'s `design/0006-site-actions-stable-tag.md` for the
 full design, including the race a concurrent push could otherwise cause and
-how `promote.yml`'s `concurrency` block plus `scripts/wait-for-canary-check.mjs`'s
-SHA-scoped poll close it.
+how `promote.yml`'s `concurrency` block plus `scripts/wait-for-canary-run.mjs`'s
+SHA-scoped poll close it. The poll reads GitHub's Actions API (workflow
+runs), not the Checks API, specifically so it needs no App permission beyond
+what `sitebrewapp` already has — see that script's own doc.
 
 A broken `promote.yml` fails loudly and leaves `stable` untouched — the
 fallback is the same manual repin every site repo used before this
