@@ -85,19 +85,25 @@ Site repos should reference this reusable workflow via
 template does this for every new fork). `stable` only ever advances after
 `.github/workflows/promote.yml` — triggered on every push to this repo's own
 `main` — validates that exact commit against a dedicated, permanent,
-non-customer site repo, `sitebrewhq/sitebrew-canary-site`: force-push a
-standing `canary/promote` branch there whose own `build.yml` is rewritten to
-call the candidate commit (GitHub requires a reusable workflow's `uses:` to
-be a static string, so this is a real file edit, not a parameterized call),
-open a PR against it (which is what actually runs the candidate through the
-real `pull_request` job above), poll that exact pushed commit's own
-workflow run, and only then force-move `stable`. See
+non-customer site repo, `sitebrewhq/sitebrew-canary-site`. Its standing
+`canary/promote` branch has a **permanent** `build.yml` (set up once, by
+hand, the same one-time-manual shape as bootstrapping `stable` itself)
+calling `uses: .../build.yml@candidate` — a fixed but moving tag this
+workflow owns exclusively. Each promotion moves `candidate` to the commit
+under test, then pushes an empty, audit-labelled commit to `canary/promote`
+to force GitHub to re-run its standing PR (the real `pull_request` job
+above, the real production code path — not a simulation), then polls that
+marker commit's own workflow run and only then force-moves `stable`. See
 `sitebrewhq/sitebrew-api`'s `design/0006-site-actions-stable-tag.md` for the
 full design, including the race a concurrent push could otherwise cause and
 how `promote.yml`'s `concurrency` block plus `scripts/wait-for-canary-run.mjs`'s
 SHA-scoped poll close it. The poll reads GitHub's Actions API (workflow
 runs), not the Checks API, specifically so it needs no App permission beyond
-what `sitebrewapp` already has — see that script's own doc.
+what `sitebrewapp` already has — see that script's own doc. `scripts/promote-canary-trigger.mjs`
+covers the tag-move + marker-commit half (an earlier version rewrote
+`canary/promote`'s `build.yml` on every promotion instead — abandoned
+because it needed a `workflows` App permission nobody has granted, and the
+executor-token mint's own guard forbids requesting it regardless).
 
 A broken `promote.yml` fails loudly and leaves `stable` untouched — the
 fallback is the same manual repin every site repo used before this
