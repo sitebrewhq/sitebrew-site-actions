@@ -36,6 +36,46 @@ test("evaluateCheckRuns: failure if any completed check-run did not conclude suc
   );
 });
 
+test("evaluateCheckRuns: an unrelated skipped check (e.g. [code]smith) does not block a real success", () => {
+  assert.deepEqual(
+    evaluateCheckRuns([
+      { status: "completed", conclusion: "success" },
+      { status: "completed", conclusion: "skipped" },
+    ]),
+    { done: true, conclusion: "success" },
+  );
+});
+
+test("evaluateCheckRuns: a neutral conclusion does not block a real success either", () => {
+  assert.deepEqual(
+    evaluateCheckRuns([
+      { status: "completed", conclusion: "success" },
+      { status: "completed", conclusion: "neutral" },
+    ]),
+    { done: true, conclusion: "success" },
+  );
+});
+
+test("evaluateCheckRuns: all skipped/neutral with no real success does not vacuously pass", () => {
+  assert.deepEqual(
+    evaluateCheckRuns([
+      { status: "completed", conclusion: "skipped" },
+      { status: "completed", conclusion: "neutral" },
+    ]),
+    { done: true, conclusion: "failure" },
+  );
+});
+
+test("evaluateCheckRuns: a real failure still blocks even alongside a skipped check", () => {
+  assert.deepEqual(
+    evaluateCheckRuns([
+      { status: "completed", conclusion: "failure" },
+      { status: "completed", conclusion: "skipped" },
+    ]),
+    { done: true, conclusion: "failure" },
+  );
+});
+
 test("waitForCandidateCheck resolves success as soon as a terminal state appears, without over-polling", async () => {
   let calls = 0;
   const sleeps = [];

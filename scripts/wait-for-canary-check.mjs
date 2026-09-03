@@ -33,12 +33,28 @@ const DEFAULT_MAX_ATTEMPTS = 20;
  * every response shape (nothing started, still running, mixed, all
  * terminal) without driving the loop's own timing or a real `fetch`.
  */
+// Conclusions that must not block a promotion on their own — an org-wide
+// check unrelated to this repo's own build can land on a commit here too
+// (DevGuru, 2026-09-03: `[code]smith` shows up as `skipped` with an empty
+// `workflowName` across today's PRs, and would likely appear on
+// `sitebrew-canary-site` the same way once it exists). `neutral` is the same
+// shape from a check's own perspective — "ran, chose not to have an
+// opinion" — not a build failure either.
+const NON_BLOCKING_CONCLUSIONS = new Set(["skipped", "neutral"]);
+
 export function evaluateCheckRuns(checkRuns) {
   if (checkRuns.length === 0) return { done: false };
   const pending = checkRuns.filter((run) => run.status !== "completed");
   if (pending.length > 0) return { done: false };
-  const failed = checkRuns.filter((run) => run.conclusion !== "success");
-  return { done: true, conclusion: failed.length === 0 ? "success" : "failure" };
+  const blocking = checkRuns.filter(
+    (run) => run.conclusion !== "success" && !NON_BLOCKING_CONCLUSIONS.has(run.conclusion),
+  );
+  if (blocking.length > 0) return { done: true, conclusion: "failure" };
+  // A set made entirely of non-blocking conclusions is not a validated
+  // build either — require at least one real `success` so an all-skipped
+  // response (nothing relevant ran at all) does not vacuously pass.
+  const succeeded = checkRuns.some((run) => run.conclusion === "success");
+  return { done: true, conclusion: succeeded ? "success" : "failure" };
 }
 
 /**
