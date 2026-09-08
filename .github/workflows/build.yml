@@ -10,10 +10,27 @@ name: sitebrew-site-actions
 # the same exchange's `/deploy-callback` (thread 1788253815.206359,
 # 2026-09-01: reuse this run's own OIDC identity rather than shipping a
 # stored `CF_API_TOKEN` into a customer-triggered workflow a second time).
+#
+# `api-base-url`/`oidc-audience` default to staging, and every site repo's
+# own `build.yml` (from `sitebrew-site-bootstrap`) calls this workflow with no
+# `with:` override at all — found live 2026-09-08 (thread 1788779979.326759,
+# Jakub): the platform's first-ever real production `create_site` silently
+# published through STAGING's api-base-url, because nothing had ever told
+# this workflow which stage it was actually running for. `deploy` and
+# `cleanup` below now each resolve their own target stage from two
+# independent, cross-checked signals (their own "Resolve this run's target
+# stage" step) rather than trusting either the stale default or an unset
+# override — see that step's own comment for the full design.
 
 on:
   workflow_call:
     inputs:
+      # Still real inputs, not removed: a caller may still pass these on
+      # purpose to point at something other than what stage-resolution would
+      # pick (a one-off test stage, say). "Resolve this run's target stage"
+      # only overrides the default value below, never a caller's own explicit
+      # `with:` override — see that step's comment for how it tells the two
+      # apart.
       api-base-url:
         description: "Base URL of the sitebrew-api stage this run publishes to"
         type: string
@@ -71,6 +88,87 @@ jobs:
       # run — a production push never reaches that step.
       pull-requests: write
     steps:
+      - name: Resolve this run's target stage
+        id: resolve-stage
+        env:
+          STAGE_VARIABLE: ${{ vars.STAGE }}
+          CALLER_API_BASE_URL: ${{ inputs.api-base-url }}
+          CALLER_OIDC_AUDIENCE: ${{ inputs.oidc-audience }}
+        run: |
+          set -euo pipefail
+          repo_name="${GITHUB_REPOSITORY#*/}"
+
+          # Signal 1 (primary): the repository's own name is stage-authoritative
+          # platform-wide (sitebrew-api's repository-name.ts, ADR-0003) —
+          # production gets the bare `site-<32-hex-id>`, every other stage gets
+          # `<stage>-site-<32-hex-id>`. Anchored, exact-match regexes only: a
+          # loose `startsWith` check would false-match an unrelated repository
+          # whose name happens to start with "site-" (e.g. sitebrewhq/site-actions
+          # is not a site repo at all, and would otherwise misread as production).
+          name_stage="unknown"
+          if [[ "${repo_name}" =~ ^site-[0-9a-f]{32}$ ]]; then
+            name_stage="production"
+          elif [[ "${repo_name}" =~ ^staging-site-[0-9a-f]{32}$ ]]; then
+            name_stage="staging"
+          fi
+
+          # Signal 2 (secondary, independent): the plain, non-secret `STAGE`
+          # repository Actions variable sitebrew-api's `create()` writes onto
+          # every repository it forks, as of 2026-09-08 (`github.ts`'s own
+          # `setStageVariable` doc explains why a bare stage name does not
+          # reopen the 2026-09-02 removal of the real Cloudflare-credential
+          # writes). Absent on every repository forked before this existed —
+          # the only reason this stays optional rather than required below.
+          # `vars.*` inside a called (`workflow_call`) workflow resolves
+          # against the CALLING repository's own variables, not this
+          # repository's — confirmed against GitHub's "Reusing workflow
+          # configurations" docs before this was written, since getting that
+          # backwards would make the whole cross-check silently useless.
+          variable_stage="${STAGE_VARIABLE:-}"
+
+          if [ -n "${variable_stage}" ] && [ "${name_stage}" != "unknown" ] && [ "${variable_stage}" != "${name_stage}" ]; then
+            echo "::error::Stage mismatch for ${GITHUB_REPOSITORY}: the repository name implies '${name_stage}', but its STAGE repository variable says '${variable_stage}'. Refusing to guess which is right — the name is set once at fork time (sitebrew-api's repository-name.ts) and the variable is written by that same create() call, so a real disagreement means one of them was edited by hand after the fact."
+            exit 1
+          fi
+
+          if [ -n "${variable_stage}" ]; then
+            stage="${variable_stage}"
+          elif [ "${name_stage}" != "unknown" ]; then
+            stage="${name_stage}"
+          else
+            # Safe default (Jakub, 2026-09-08, thread 1788779979.326759):
+            # anything ambiguous or unrecognized, with no variable to fall
+            # back on either, resolves to staging — never production. A real
+            # production site 404s visibly rather than a test accidentally
+            # touching real customer data.
+            stage="staging"
+          fi
+
+          # The caller's own `with:` override, if it gave one, wins outright —
+          # this step only replaces the *default* value nobody overrode
+          # (every site repo's own build.yml does exactly that today, which is
+          # the actual bug this step exists to fix), never a deliberate
+          # explicit choice. Comparing against the known staging default is
+          # the only way to tell "left at default" apart from "explicitly set
+          # to the same value on purpose" with what a workflow_call input
+          # exposes — the two are handled identically either way, so the
+          # ambiguity costs nothing.
+          if [ "${CALLER_API_BASE_URL}" != "https://api-staging.sitebrew.app" ] || [ "${CALLER_OIDC_AUDIENCE}" != "sitebrew-actions-staging" ]; then
+            api_base_url="${CALLER_API_BASE_URL}"
+            oidc_audience="${CALLER_OIDC_AUDIENCE}"
+          elif [ "${stage}" = "production" ]; then
+            api_base_url="https://api.sitebrew.app"
+            oidc_audience="sitebrew-actions-production"
+          else
+            api_base_url="${CALLER_API_BASE_URL}"
+            oidc_audience="${CALLER_OIDC_AUDIENCE}"
+          fi
+
+          echo "Resolved stage=${stage} (name=${name_stage}, variable=${variable_stage:-<absent>}) api-base-url=${api_base_url}"
+          echo "stage=${stage}" >> "$GITHUB_OUTPUT"
+          echo "api-base-url=${api_base_url}" >> "$GITHUB_OUTPUT"
+          echo "oidc-audience=${oidc_audience}" >> "$GITHUB_OUTPUT"
+
       - name: Download build artifact
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
@@ -80,7 +178,7 @@ jobs:
       - name: Request GitHub OIDC token
         id: oidc
         env:
-          AUDIENCE: ${{ inputs.oidc-audience }}
+          AUDIENCE: ${{ steps.resolve-stage.outputs.oidc-audience }}
         run: |
           set -euo pipefail
           resp=$(curl -sSf -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
@@ -92,7 +190,7 @@ jobs:
       - name: Mint R2 upload credential
         id: mint
         env:
-          API_BASE_URL: ${{ inputs.api-base-url }}
+          API_BASE_URL: ${{ steps.resolve-stage.outputs.api-base-url }}
           OIDC_TOKEN: ${{ steps.oidc.outputs.token }}
         run: |
           set -euo pipefail
@@ -172,7 +270,7 @@ jobs:
       - name: Report publish result
         if: always() && github.event_name == 'push'
         env:
-          API_BASE_URL: ${{ inputs.api-base-url }}
+          API_BASE_URL: ${{ steps.resolve-stage.outputs.api-base-url }}
           OIDC_TOKEN: ${{ steps.oidc.outputs.token }}
           UPLOAD_OUTCOME: ${{ steps.upload.outcome }}
         run: |
@@ -200,7 +298,7 @@ jobs:
         id: preview
         if: github.event_name == 'pull_request'
         env:
-          API_BASE_URL: ${{ inputs.api-base-url }}
+          API_BASE_URL: ${{ steps.resolve-stage.outputs.api-base-url }}
           OIDC_TOKEN: ${{ steps.oidc.outputs.token }}
         run: |
           set -euo pipefail
@@ -237,6 +335,59 @@ jobs:
       contents: read
       id-token: write
     steps:
+      # Same two-signal resolution as the `deploy` job's own step of the same
+      # name — see that one for the full design comment. Duplicated rather
+      # than factored out because this workflow has no internal composite
+      # action today and every other step already duplicates this way between
+      # `deploy` and `cleanup` (OIDC request, credential mint, self-checkout).
+      - name: Resolve this run's target stage
+        id: resolve-stage
+        env:
+          STAGE_VARIABLE: ${{ vars.STAGE }}
+          CALLER_API_BASE_URL: ${{ inputs.api-base-url }}
+          CALLER_OIDC_AUDIENCE: ${{ inputs.oidc-audience }}
+        run: |
+          set -euo pipefail
+          repo_name="${GITHUB_REPOSITORY#*/}"
+
+          name_stage="unknown"
+          if [[ "${repo_name}" =~ ^site-[0-9a-f]{32}$ ]]; then
+            name_stage="production"
+          elif [[ "${repo_name}" =~ ^staging-site-[0-9a-f]{32}$ ]]; then
+            name_stage="staging"
+          fi
+
+          variable_stage="${STAGE_VARIABLE:-}"
+
+          if [ -n "${variable_stage}" ] && [ "${name_stage}" != "unknown" ] && [ "${variable_stage}" != "${name_stage}" ]; then
+            echo "::error::Stage mismatch for ${GITHUB_REPOSITORY}: the repository name implies '${name_stage}', but its STAGE repository variable says '${variable_stage}'. Refusing to guess which is right — the name is set once at fork time (sitebrew-api's repository-name.ts) and the variable is written by that same create() call, so a real disagreement means one of them was edited by hand after the fact."
+            exit 1
+          fi
+
+          if [ -n "${variable_stage}" ]; then
+            stage="${variable_stage}"
+          elif [ "${name_stage}" != "unknown" ]; then
+            stage="${name_stage}"
+          else
+            stage="staging"
+          fi
+
+          if [ "${CALLER_API_BASE_URL}" != "https://api-staging.sitebrew.app" ] || [ "${CALLER_OIDC_AUDIENCE}" != "sitebrew-actions-staging" ]; then
+            api_base_url="${CALLER_API_BASE_URL}"
+            oidc_audience="${CALLER_OIDC_AUDIENCE}"
+          elif [ "${stage}" = "production" ]; then
+            api_base_url="https://api.sitebrew.app"
+            oidc_audience="sitebrew-actions-production"
+          else
+            api_base_url="${CALLER_API_BASE_URL}"
+            oidc_audience="${CALLER_OIDC_AUDIENCE}"
+          fi
+
+          echo "Resolved stage=${stage} (name=${name_stage}, variable=${variable_stage:-<absent>}) api-base-url=${api_base_url}"
+          echo "stage=${stage}" >> "$GITHUB_OUTPUT"
+          echo "api-base-url=${api_base_url}" >> "$GITHUB_OUTPUT"
+          echo "oidc-audience=${oidc_audience}" >> "$GITHUB_OUTPUT"
+
       - name: Checkout PR head
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.2.2
         with:
@@ -252,7 +403,7 @@ jobs:
       - name: Request GitHub OIDC token
         id: oidc
         env:
-          AUDIENCE: ${{ inputs.oidc-audience }}
+          AUDIENCE: ${{ steps.resolve-stage.outputs.oidc-audience }}
         run: |
           set -euo pipefail
           resp=$(curl -sSf -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
@@ -264,7 +415,7 @@ jobs:
       - name: Mint R2 delete credential
         id: mint
         env:
-          API_BASE_URL: ${{ inputs.api-base-url }}
+          API_BASE_URL: ${{ steps.resolve-stage.outputs.api-base-url }}
           OIDC_TOKEN: ${{ steps.oidc.outputs.token }}
         run: |
           set -euo pipefail
@@ -321,7 +472,7 @@ jobs:
 
       - name: Remove preview hostname
         env:
-          API_BASE_URL: ${{ inputs.api-base-url }}
+          API_BASE_URL: ${{ steps.resolve-stage.outputs.api-base-url }}
           OIDC_TOKEN: ${{ steps.oidc.outputs.token }}
         run: |
           set -euo pipefail
