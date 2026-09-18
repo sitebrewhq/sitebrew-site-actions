@@ -84,7 +84,7 @@ env:
 
 jobs:
   promote:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     permissions:
       # To force-move this repository's own `stable` tag on success, with
       # the default `GITHUB_TOKEN` — no cross-repo credential needed for a
