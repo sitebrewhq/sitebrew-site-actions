@@ -293,6 +293,34 @@ jobs:
           SITE_DIR: public
         run: node .site-actions/scripts/upload-to-r2.mjs
 
+      # Deletes this run's own `site` build artifact from GitHub Actions
+      # storage right after it's been downloaded and used above, instead of
+      # leaving it to its full 24h `retention-days` — the org-wide storage
+      # quota ~170 site repositories share is what caused the upload retries
+      # above to exist in the first place (`sitebrew-api#242`). Calls
+      # `sitebrew-api`'s `/v1/actions/artifact-cleanup` rather than deleting
+      # it directly here with this job's own `actions: write`: that
+      # permission is never granted by any already-forked site repository's
+      # own `permissions:` block, so requesting it here would silently
+      # `startup_failure` `deploy` on all of them (DevGuru, review of #9).
+      # Only after a successful upload — a failed upload means `public/`
+      # never left this run, and the artifact should stick around for
+      # whoever investigates. Never fails the job on error, the same as
+      # "Report publish result" below: the site is already live in R2 or it
+      # isn't by the time this runs, and a cleanup hiccup must not flip that
+      # verdict.
+      - name: Clean up build artifact
+        if: steps.upload.outcome == 'success'
+        env:
+          API_BASE_URL: ${{ steps.resolve-stage.outputs.api-base-url }}
+          OIDC_TOKEN: ${{ steps.oidc.outputs.token }}
+        run: |
+          status=$(curl -sS -o /tmp/artifact-cleanup-response.json -w '%{http_code}' -X POST "${API_BASE_URL}/v1/actions/artifact-cleanup" \
+            -H "Authorization: Bearer ${OIDC_TOKEN}")
+          if [ "${status}" -ge 300 ]; then
+            echo "::warning::artifact-cleanup returned HTTP ${status}: $(cat /tmp/artifact-cleanup-response.json)"
+          fi
+
       # Closes the `publishJob` row `publishChange` opened for this run
       # (`publish-job-status-fix`, 2026-09-02, MEM-475) — without this,
       # `get_job`/`get_site` read that row stuck at "queued" forever, because
