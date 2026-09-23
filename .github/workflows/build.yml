@@ -77,7 +77,7 @@ jobs:
       # `actions/upload-artifact` has no built-in retry, and the org-wide
       # GitHub Actions *storage* quota (distinct from the compute-minute
       # quota Blacksmith above replaces) is intermittently exhausted by the
-      # ~50 site repositories sharing it (`sitebrew-api#242`, 2026-09-23:
+      # ~170 site repositories sharing it (`sitebrew-api#242`, 2026-09-23:
       # every one of 10 real failures on one site that day was the identical
       # "Failed to CreateArtifact: Artifact storage quota has been hit" at
       # this exact step — `Build` above always succeeded — and every one
@@ -126,11 +126,6 @@ jobs:
       # Only used by "Comment preview URL" below, and only on a pull_request
       # run — a production push never reaches that step.
       pull-requests: write
-      # Only used by "Delete build artifact" below, to remove the `site`
-      # artifact this job already downloaded and used — see that step's own
-      # comment. Scoped to this repository only, the same as every other
-      # permission here.
-      actions: write
     steps:
       - name: Resolve this run's target stage
         id: resolve-stage
@@ -297,41 +292,6 @@ jobs:
           R2_SESSION_TOKEN: ${{ steps.mint.outputs.sessionToken }}
           SITE_DIR: public
         run: node .site-actions/scripts/upload-to-r2.mjs
-
-      # The `site` artifact only exists to hand `public/` from `build` to
-      # this job — nothing downstream ever reads it again after "Download
-      # build artifact" above. Left alone it sits on GitHub's shared, org-
-      # wide Actions storage quota for up to its full `retention-days: 1`
-      # even though it has been dead weight since the moment this job
-      # started (`sitebrew-api#242`, 2026-09-23 — that shared quota,
-      # exhausted by the ~50 site repositories on it, is why "Upload build
-      # artifact" above intermittently fails). Deleting it here, the moment
-      # it's no longer needed, instead of waiting out the full day, is the
-      # direct fix: less dead-artifact backlog counted against the shared
-      # quota at any given moment. `if: steps.upload.outcome == 'success'`
-      # only: if the R2 upload itself failed, keep the artifact around for
-      # whoever investigates rather than deleting evidence.
-      # `continue-on-error: true` because a cleanup failure must never flip
-      # an otherwise successful deploy to failed.
-      - name: Delete build artifact
-        if: steps.upload.outcome == 'success'
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          artifact_id=$(curl -sSf -H "Authorization: Bearer ${GH_TOKEN}" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/artifacts?name=site" \
-            | node -e '
-                const c = JSON.parse(require("fs").readFileSync(0, "utf8"));
-                const a = c.artifacts && c.artifacts[0];
-                if (!a) { console.error("no site artifact found for this run"); process.exit(1); }
-                process.stdout.write(String(a.id));
-              ')
-          curl -sSf -X DELETE -H "Authorization: Bearer ${GH_TOKEN}" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/artifacts/${artifact_id}"
 
       # Closes the `publishJob` row `publishChange` opened for this run
       # (`publish-job-status-fix`, 2026-09-02, MEM-475) — without this,
