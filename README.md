@@ -35,8 +35,8 @@ with no useful log, not a permission-denied error on the specific step).
 
 The caller's own repository must have its **selected actions** allowlist
 include this workflow *and* every action it calls internally (`actions/checkout`,
-`peaceiris/actions-hugo`, `actions/upload-artifact`, `actions/download-artifact`,
-`actions/github-script` — verified live 2026-09-01 that GitHub's allowlist
+`peaceiris/actions-hugo`, `actions/cache`, `actions/github-script` — verified
+live 2026-09-01 that GitHub's allowlist
 gates actions used inside a called reusable workflow too, not just the
 workflow file itself).
 

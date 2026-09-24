@@ -65,51 +65,27 @@ jobs:
           extended: true
       - name: Build
         run: hugo --gc --minify
-      - name: Upload build artifact
-        id: upload-artifact-1
-        continue-on-error: true
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: site
-          path: public
-          retention-days: 1
 
-      # `actions/upload-artifact` has no built-in retry, and the org-wide
-      # GitHub Actions *storage* quota (distinct from the compute-minute
-      # quota Blacksmith above replaces) is intermittently exhausted by the
-      # ~170 site repositories sharing it (`sitebrew-api#242`, 2026-09-23:
-      # every one of 10 real failures on one site that day was the identical
+      # `actions/cache`, not `actions/upload-artifact`: the org-wide GitHub
+      # Actions *artifact storage* quota (distinct from the compute-minute
+      # quota Blacksmith above replaces) is a single pool the ~170 site
+      # repositories share, and it was exhausted for most of 2026-09-23
+      # (`sitebrew-api#242` — every failure that day was an identical
       # "Failed to CreateArtifact: Artifact storage quota has been hit" at
-      # this exact step — `Build` above always succeeded — and every one
-      # eventually succeeded on a later attempt once other artifacts
-      # elsewhere in the org expired). Retrying the same already-pinned
-      # action in place, rather than adding a third-party retry action, gives
-      # a failed upload a second and third chance within this run instead of
-      # requiring whoever dispatched the change to notice the failure and
-      # re-try it by hand.
-      - name: Wait before retrying artifact upload
-        if: steps.upload-artifact-1.outcome == 'failure'
-        run: sleep 20
-      - name: Upload build artifact (retry 1)
-        id: upload-artifact-2
-        if: steps.upload-artifact-1.outcome == 'failure'
-        continue-on-error: true
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      # this exact step, `Build` above always succeeded, and a same-run retry
+      # only ever worked opportunistically once something else in the org
+      # happened to expire). `actions/cache` draws from a completely
+      # different quota — 10 GB, scoped per repository rather than shared
+      # org-wide — so a single busy site can no longer starve every other
+      # site's publish. It also needs no extra `permissions:` beyond what
+      # this job already has: unlike the REST artifact-delete call the
+      # now-removed cleanup step below used, cache save/restore authenticates
+      # through the runner's own built-in cache-service token.
+      - name: Save build output to cache
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          name: site
           path: public
-          retention-days: 1
-      - name: Wait before retrying artifact upload again
-        if: steps.upload-artifact-1.outcome == 'failure' && steps.upload-artifact-2.outcome == 'failure'
-        run: sleep 45
-      - name: Upload build artifact (retry 2)
-        id: upload-artifact-3
-        if: steps.upload-artifact-1.outcome == 'failure' && steps.upload-artifact-2.outcome == 'failure'
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: site
-          path: public
-          retention-days: 1
+          key: site-build-${{ github.run_id }}
 
   deploy:
     needs: build
@@ -208,11 +184,18 @@ jobs:
           echo "api-base-url=${api_base_url}" >> "$GITHUB_OUTPUT"
           echo "oidc-audience=${oidc_audience}" >> "$GITHUB_OUTPUT"
 
-      - name: Download build artifact
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+      # `fail-on-cache-miss`: the `build` job's own `Save build output to
+      # cache` step ran under the same `github.run_id`, so a miss here means
+      # something actually went wrong (build failed silently, or the two
+      # jobs somehow disagree on the key) rather than a legitimate "nothing
+      # to deploy" — surface that as a hard failure instead of uploading
+      # whatever happens to be in an empty `public/`.
+      - name: Restore build output from cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          name: site
           path: public
+          key: site-build-${{ github.run_id }}
+          fail-on-cache-miss: true
 
       - name: Request GitHub OIDC token
         id: oidc
@@ -293,33 +276,15 @@ jobs:
           SITE_DIR: public
         run: node .site-actions/scripts/upload-to-r2.mjs
 
-      # Deletes this run's own `site` build artifact from GitHub Actions
-      # storage right after it's been downloaded and used above, instead of
-      # leaving it to its full 24h `retention-days` — the org-wide storage
-      # quota ~170 site repositories share is what caused the upload retries
-      # above to exist in the first place (`sitebrew-api#242`). Calls
-      # `sitebrew-api`'s `/v1/actions/artifact-cleanup` rather than deleting
-      # it directly here with this job's own `actions: write`: that
-      # permission is never granted by any already-forked site repository's
-      # own `permissions:` block, so requesting it here would silently
-      # `startup_failure` `deploy` on all of them (DevGuru, review of #9).
-      # Only after a successful upload — a failed upload means `public/`
-      # never left this run, and the artifact should stick around for
-      # whoever investigates. Never fails the job on error, the same as
-      # "Report publish result" below: the site is already live in R2 or it
-      # isn't by the time this runs, and a cleanup hiccup must not flip that
-      # verdict.
-      - name: Clean up build artifact
-        if: steps.upload.outcome == 'success'
-        env:
-          API_BASE_URL: ${{ steps.resolve-stage.outputs.api-base-url }}
-          OIDC_TOKEN: ${{ steps.oidc.outputs.token }}
-        run: |
-          status=$(curl -sS -o /tmp/artifact-cleanup-response.json -w '%{http_code}' -X POST "${API_BASE_URL}/v1/actions/artifact-cleanup" \
-            -H "Authorization: Bearer ${OIDC_TOKEN}")
-          if [ "${status}" -ge 300 ]; then
-            echo "::warning::artifact-cleanup returned HTTP ${status}: $(cat /tmp/artifact-cleanup-response.json)"
-          fi
+      # No cleanup step here anymore (2026-09-24, sa#242): `public/` now
+      # travels via `actions/cache`, not `actions/upload-artifact`, so there
+      # is no GitHub Actions *artifact* left behind for
+      # `sitebrew-api`'s `/v1/actions/artifact-cleanup` to delete — calling
+      # it would just look up this run's artifact list, find it empty, and
+      # no-op. Cache entries fall under a separate, per-repository 10 GB
+      # quota with GitHub's own automatic (LRU / 7-day-unused) eviction, the
+      # crowding problem this replaces `upload-artifact` for in the first
+      # place — no equivalent active cleanup is needed.
 
       # Closes the `publishJob` row `publishChange` opened for this run
       # (`publish-job-status-fix`, 2026-09-02, MEM-475) — without this,
