@@ -78,6 +78,35 @@ and a list-then-delete flow would need a second, query-string SigV4 signing
 path for no gain over rebuilding the same commit. It then calls
 `DELETE <api-base-url>/v1/actions/deploy-callback` to remove the KV mapping.
 
+## Opt-in npm-based build tooling (e.g. Tailwind CSS)
+
+Both `build` and `cleanup` run `npm ci` before `hugo` whenever the site
+repository has a `package.json` — a no-op, zero-cost step for a site that
+doesn't. This is what a site needs to use Hugo's `css.TailwindCSS` function
+(https://gohugo.io/functions/css/tailwindcss/), useful in particular when
+migrating a page from an original Tailwind-based site and wanting to reuse
+its utility classes close to verbatim instead of hand-translating them into
+bespoke CSS. To opt in, a site repo adds:
+
+1. A `package.json` with `tailwindcss`/`@tailwindcss/cli` as dependencies.
+2. `with: hugo-version: "0.161.0"` (or newer) on its own `build.yml`'s call
+   into this workflow — the default here intentionally stays below that
+   floor so the ~170 sites that don't use this feature see no Hugo version
+   change. As of Hugo v0.161.0 the Tailwind *standalone binary* is no longer
+   supported; the CLI must come from npm, which is exactly what the new step
+   above installs.
+3. Its own `hugo.toml` additions (`security.exec.allow` for `tailwindcss`/
+   `node`/`postcss`, `build.buildStats`, and the `hugo_stats.json` module
+   mount) and a `layouts/_partials/css.html` using `templates.Defer` — see
+   Hugo's own docs page above for the exact snippet; this repo has no
+   central `hugo.toml` to change it in, since that file lives in each site.
+
+Not currently supported: agent-driven (`sitebrew-executor`) edits to a
+Tailwind-opted-in site. That sandbox denies `npm install`/`npx` at runtime by
+design and doesn't bake in a `tailwindcss` CLI, so a `hugo` preview build
+inside a `site_change` job would fail on such a site — out of scope here,
+tracked in issue #14.
+
 ## The `stable` tag and `promote.yml`
 
 Site repos should reference this reusable workflow via

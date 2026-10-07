@@ -63,6 +63,20 @@ jobs:
         with:
           hugo-version: ${{ inputs.hugo-version }}
           extended: true
+      # Opt-in only, zero cost to the ~170 sites without a `package.json`:
+      # npm-based Hugo build tooling (e.g. `css.TailwindCSS`, which needs the
+      # `tailwindcss` CLI on PATH as of Hugo v0.161.0 — the standalone binary
+      # is no longer supported) needs `node_modules` installed before `hugo`
+      # runs. A plain `run:` step rather than `actions/setup-node`
+      # deliberately: this repo's other steps already call bare `node -e`
+      # with no setup-node action, proving Node ships on this runner image
+      # already, and a caller repo's selected-actions allowlist gates every
+      # action used *inside* this reusable workflow (see README /
+      # `actions/cache` switch) — a new action here would mean a fleet-wide
+      # allowlist rollout for a step most sites never exercise.
+      - name: Install npm dependencies (if the site opts in)
+        if: hashFiles('package.json') != ''
+        run: npm ci
       - name: Build
         run: hugo --gc --minify
 
@@ -429,6 +443,13 @@ jobs:
         with:
           hugo-version: ${{ inputs.hugo-version }}
           extended: true
+      # Same opt-in npm step as the `build` job above — this job rebuilds the
+      # closed PR's last commit to get its file list for deletion, so it
+      # needs the same `node_modules` the original build had, or it fails
+      # for any Tailwind-opted-in site's preview cleanup.
+      - name: Install npm dependencies (if the site opts in)
+        if: hashFiles('package.json') != ''
+        run: npm ci
       - name: Build
         run: hugo --gc --minify
 
