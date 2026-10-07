@@ -63,6 +63,21 @@ jobs:
         with:
           hugo-version: ${{ inputs.hugo-version }}
           extended: true
+      # Opt-in only, zero cost to the ~170 sites without a `package-lock.json`
+      # (the file `npm ci` itself actually requires, not just `package.json`):
+      # npm-based Hugo build tooling (e.g. `css.TailwindCSS`, which needs the
+      # `tailwindcss` CLI on PATH as of Hugo v0.161.0 — the standalone binary
+      # is no longer supported) needs `node_modules` installed before `hugo`
+      # runs. A plain `run:` step rather than `actions/setup-node`
+      # deliberately: this repo's other steps already call bare `node -e`
+      # with no setup-node action, proving Node ships on this runner image
+      # already, and a caller repo's selected-actions allowlist gates every
+      # action used *inside* this reusable workflow (see README /
+      # `actions/cache` switch) — a new action here would mean a fleet-wide
+      # allowlist rollout for a step most sites never exercise.
+      - name: Install npm dependencies (if the site opts in)
+        if: hashFiles('package-lock.json') != ''
+        run: npm ci
       - name: Build
         run: hugo --gc --minify
 
@@ -360,8 +375,48 @@ jobs:
   # and deletes the resulting file list, rather than adding a second
   # (query-string) SigV4 signing path just to list what's there first. See
   # `scripts/delete-from-r2.mjs`'s own module doc.
-  cleanup:
+  # Split the same way `build`/`deploy` above are split (design/0005 §8):
+  # untrusted site-repo code (the Hugo build, and now optionally `npm ci`)
+  # stays in a job with no credential-minting capability at all. This used
+  # to be a single `cleanup` job that ran the PR's own `npm ci`/`hugo` build
+  # *and* held `id-token: write` for the whole job — DevGuru's review of the
+  # Tailwind opt-in PR (#15) caught that this makes `id-token: write`
+  # reachable to anything a site repo's own (possibly malicious or merely
+  # compromised-transitive-dependency) `npm ci` run chooses to do: the OIDC
+  # request env vars (`ACTIONS_ID_TOKEN_REQUEST_TOKEN`/`_URL`) are ambient to
+  # every step in a job once that permission is granted, regardless of step
+  # order, so a postinstall script could mint its own token and trade it at
+  # `/v1/actions/upload-token` for live R2 credentials scoped to this site.
+  # `build` above was never vulnerable to this (always `contents: read`
+  # only) — only `cleanup` combined untrusted code with a live credential.
+  cleanup-build:
     if: github.event_name == 'pull_request' && github.event.action == 'closed'
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout PR head
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.2.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+      - name: Install Hugo
+        uses: peaceiris/actions-hugo@2752ce1d29631191ea3f27c23495fa06139a5b78 # v3.0.0
+        with:
+          hugo-version: ${{ inputs.hugo-version }}
+          extended: true
+      - name: Install npm dependencies (if the site opts in)
+        if: hashFiles('package-lock.json') != ''
+        run: npm ci
+      - name: Build
+        run: hugo --gc --minify
+      - name: Save build output to cache
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: public
+          key: cleanup-build-${{ github.run_id }}
+
+  cleanup:
+    needs: cleanup-build
     runs-on: blacksmith-2vcpu-ubuntu-2404
     permissions:
       contents: read
@@ -420,17 +475,16 @@ jobs:
           echo "api-base-url=${api_base_url}" >> "$GITHUB_OUTPUT"
           echo "oidc-audience=${oidc_audience}" >> "$GITHUB_OUTPUT"
 
-      - name: Checkout PR head
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.2.2
+      # Restored from `cleanup-build`'s cache rather than rebuilt here — this
+      # job holds `id-token: write`, so it must never run the site repo's own
+      # code (Hugo templates, and especially an opt-in `npm ci`) itself. See
+      # `cleanup-build`'s own comment above for why that split exists.
+      - name: Restore build output from cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
-      - name: Install Hugo
-        uses: peaceiris/actions-hugo@2752ce1d29631191ea3f27c23495fa06139a5b78 # v3.0.0
-        with:
-          hugo-version: ${{ inputs.hugo-version }}
-          extended: true
-      - name: Build
-        run: hugo --gc --minify
+          path: public
+          key: cleanup-build-${{ github.run_id }}
+          fail-on-cache-miss: true
 
       - name: Request GitHub OIDC token
         id: oidc
