@@ -161,6 +161,13 @@ async function putObject({ url, body, contentType, accessKeyId, secretAccessKey,
  */
 const UPLOAD_CONCURRENCY = 8;
 
+/**
+ * On the first rejected `worker` call, `Promise.all` below rejects right
+ * away, but the other `runNext` loops already in flight keep going
+ * uncancelled — intentional, not a bug: `main()` catches and
+ * `process.exit(1)`s shortly after, and adding cancellation here would be
+ * more code for a run that is about to die anyway.
+ */
 async function runWithConcurrency(items, limit, worker) {
   let next = 0;
   async function runNext() {
