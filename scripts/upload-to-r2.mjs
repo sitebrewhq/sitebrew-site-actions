@@ -93,6 +93,14 @@ function encodeUriPath(path) {
  * applied to one fixed PUT — factored out from `putObject` so a test can
  * pin `now` and check the resulting `authorization` header against a frozen
  * reference value, instead of only checking the request went out.
+ *
+ * `url`'s path must already be percent-encoded via `encodeUriPath` (as
+ * `uploadDirectoryToR2` does when building it) — `new URL()` below auto-
+ * encodes non-ASCII bytes to `%XX` on its own, so `pathname` comes back
+ * already escaped once; running `encodeUriPath` on it again here would
+ * escape that literal `%`, producing a canonical-request path that
+ * disagrees with the one `fetch` actually puts on the wire and breaking
+ * the signature for any key outside plain ASCII.
  */
 export function signPutRequest({ url, body, contentType, accessKeyId, secretAccessKey, sessionToken, now = new Date() }) {
   const { hostname, pathname } = new URL(url);
@@ -114,7 +122,7 @@ export function signPutRequest({ url, body, contentType, accessKeyId, secretAcce
 
   const canonicalRequest = [
     "PUT",
-    encodeUriPath(pathname),
+    pathname,
     "",
     canonicalHeaders,
     signedHeaders,
@@ -144,6 +152,33 @@ async function putObject({ url, body, contentType, accessKeyId, secretAccessKey,
   return fetchImpl(url, { method: "PUT", body, headers });
 }
 
+/**
+ * How many PUTs run at once. Each one is a full SigV4 round-trip to R2, so a
+ * plain `for...of` with `await` inside (the previous shape) serialized every
+ * file behind the one before it — fine for a handful of files, the whole
+ * runtime for a few hundred. No npm dependency for this (see module doc):
+ * a fixed-size pool of workers pulling from a shared index is ~10 lines.
+ */
+const UPLOAD_CONCURRENCY = 8;
+
+/**
+ * On the first rejected `worker` call, `Promise.all` below rejects right
+ * away, but the other `runNext` loops already in flight keep going
+ * uncancelled — intentional, not a bug: `main()` catches and
+ * `process.exit(1)`s shortly after, and adding cancellation here would be
+ * more code for a run that is about to die anyway.
+ */
+async function runWithConcurrency(items, limit, worker) {
+  let next = 0;
+  async function runNext() {
+    while (next < items.length) {
+      const index = next++;
+      await worker(items[index]);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, runNext));
+}
+
 /** Upload every file under `directory` to `<prefix><relativePath>` in `bucket`. */
 export async function uploadDirectoryToR2({
   directory,
@@ -159,10 +194,10 @@ export async function uploadDirectoryToR2({
   const endpoint = `https://${accountId}.r2.cloudflarestorage.com`;
   const files = await listFiles(directory);
 
-  for (const path of files) {
+  await runWithConcurrency(files, UPLOAD_CONCURRENCY, async (path) => {
     const body = await readFile(join(directory, path));
     const key = `${prefix}${path}`;
-    const url = `${endpoint}/${bucket}/${key}`;
+    const url = `${endpoint}/${bucket}/${encodeUriPath(key)}`;
     const response = await putObject({
       url,
       body,
@@ -177,7 +212,7 @@ export async function uploadDirectoryToR2({
       throw new Error(`uploading ${key} answered ${response.status}: ${detail.slice(0, 300)}`);
     }
     log(`uploaded ${key}`);
-  }
+  });
 
   return { uploaded: files.length };
 }
