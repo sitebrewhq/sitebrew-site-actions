@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { contentTypeFor, listFiles, signPutRequest } from "./upload-to-r2.mjs";
+import { contentTypeFor, listFiles, signPutRequest, uploadDirectoryToR2 } from "./upload-to-r2.mjs";
 
 test("contentTypeFor matches sitebrew-worker's guessType for common extensions", () => {
   assert.equal(contentTypeFor("index.html"), "text/html; charset=utf-8");
@@ -66,4 +66,106 @@ test("signPutRequest omits x-amz-security-token when no sessionToken is given", 
   });
   assert.equal("x-amz-security-token" in headers, false);
   assert.ok(!headers.authorization.includes("x-amz-security-token"));
+});
+
+/**
+ * Regression for the diacritics upload failure (sa#287): `uploadDirectoryToR2`
+ * must hand `signPutRequest` a `url` whose path is already percent-encoded
+ * exactly once, matching what `fetch` puts on the wire. Reference signature
+ * computed independently in a separate script re-implementing AWS's
+ * documented canonical-path encoding byte-by-byte (not by calling anything in
+ * this module) — confirmed to differ from what the pre-fix code produced for
+ * this same path (it signed a doubly-encoded path that disagreed with the
+ * actual request, which is exactly the `403 SignatureDoesNotMatch` reported).
+ */
+test("signPutRequest produces the correct signature for a path containing diacritics, given a pre-encoded url", () => {
+  const encodeUriSegment = (s) =>
+    encodeURIComponent(s).replace(/[!'()*]/g, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`);
+  const encodeUriPath = (p) => p.split("/").map(encodeUriSegment).join("/");
+  const key = "sites/site_abc/čtvrtek.png";
+  const url = `https://acct123.r2.cloudflarestorage.com/sitebrew-sites/${encodeUriPath(key)}`;
+
+  const { headers } = signPutRequest({
+    url,
+    body: Buffer.from("hello\n"),
+    contentType: "image/png",
+    accessKeyId: "AKIDEXAMPLE",
+    secretAccessKey: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    sessionToken: "FAKESESSIONTOKEN",
+    now: new Date("2026-09-01T16:17:56.000Z"),
+  });
+
+  assert.equal(
+    headers.authorization,
+    "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260901/auto/s3/aws4_request, " +
+      "SignedHeaders=content-length;content-type;host;x-amz-content-sha256;x-amz-date;x-amz-security-token, " +
+      "Signature=05cd88074941b632f9b309973ab48893195054b9ae69d436096b256720b68180",
+  );
+});
+
+test("uploadDirectoryToR2 sends a singly-encoded path for diacritics filenames (no 403 on the real request)", async () => {
+  const { mkdtemp, writeFile, rm } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const dir = await mkdtemp(join(tmpdir(), "site-actions-test-"));
+  try {
+    await writeFile(join(dir, "čtvrtek.png"), "x");
+    const calls = [];
+    const fetchImpl = async (url) => {
+      calls.push(url);
+      return { ok: true, text: async () => "" };
+    };
+    await uploadDirectoryToR2({
+      directory: dir,
+      accountId: "acct123",
+      bucket: "sitebrew-sites",
+      prefix: "sites/site_abc/",
+      accessKeyId: "AKID",
+      secretAccessKey: "SECRET",
+      fetchImpl,
+      log: () => {},
+    });
+    assert.equal(calls.length, 1);
+    const { pathname } = new URL(calls[0]);
+    assert.ok(!pathname.includes("%25"), `path must not be double-encoded, got ${pathname}`);
+    assert.equal(decodeURIComponent(pathname), "/sitebrew-sites/sites/site_abc/čtvrtek.png");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("uploadDirectoryToR2 runs uploads concurrently instead of one at a time", async () => {
+  const { mkdtemp, writeFile, rm } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const dir = await mkdtemp(join(tmpdir(), "site-actions-test-"));
+  try {
+    for (let i = 0; i < 5; i++) await writeFile(join(dir, `file-${i}.txt`), "x");
+
+    let inFlight = 0;
+    let maxInFlight = 0;
+    const fetchImpl = async () => {
+      inFlight++;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      inFlight--;
+      return { ok: true, text: async () => "" };
+    };
+
+    const result = await uploadDirectoryToR2({
+      directory: dir,
+      accountId: "acct123",
+      bucket: "sitebrew-sites",
+      prefix: "sites/x/",
+      accessKeyId: "AKID",
+      secretAccessKey: "SECRET",
+      fetchImpl,
+      log: () => {},
+    });
+
+    assert.equal(result.uploaded, 5);
+    assert.ok(maxInFlight > 1, `expected overlapping requests, max concurrent was ${maxInFlight}`);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 });
