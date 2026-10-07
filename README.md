@@ -80,15 +80,21 @@ path for no gain over rebuilding the same commit. It then calls
 
 ## Opt-in npm-based build tooling (e.g. Tailwind CSS)
 
-Both `build` and `cleanup` run `npm ci` before `hugo` whenever the site
-repository has a `package.json` — a no-op, zero-cost step for a site that
-doesn't. This is what a site needs to use Hugo's `css.TailwindCSS` function
+`build` and `cleanup-build` each run `npm ci` before `hugo` whenever the site
+repository has a `package-lock.json` (the file `npm ci` itself requires, not
+just `package.json`) — a no-op, zero-cost step for a site that doesn't. This
+is what a site needs to use Hugo's `css.TailwindCSS` function
 (https://gohugo.io/functions/css/tailwindcss/), useful in particular when
 migrating a page from an original Tailwind-based site and wanting to reuse
 its utility classes close to verbatim instead of hand-translating them into
-bespoke CSS. To opt in, a site repo adds:
+bespoke CSS. Both of these are credential-free jobs by design (`contents:
+read` only) — the `deploy`/`cleanup` jobs that hold `id-token: write` only
+ever restore the already-built `public/` from cache, never run the site
+repo's own code, so nothing a site's own `npm ci` run does can reach a live
+R2 credential. To opt in, a site repo adds:
 
-1. A `package.json` with `tailwindcss`/`@tailwindcss/cli` as dependencies.
+1. A `package.json` **and committed `package-lock.json`** with
+   `tailwindcss`/`@tailwindcss/cli` as dependencies.
 2. `with: hugo-version: "0.161.0"` (or newer) on its own `build.yml`'s call
    into this workflow — the default here intentionally stays below that
    floor so the ~170 sites that don't use this feature see no Hugo version
