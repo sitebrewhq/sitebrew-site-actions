@@ -39,9 +39,21 @@ on:
         description: "Must match sitebrew-api's ACTIONS_OIDC_AUDIENCE for that stage (sitebrew-actions-<stage>)"
         type: string
         default: "sitebrew-actions-staging"
+      # Fleet-wide default, moved from "0.147.0" to "0.161.0" on 2026-10-08
+      # (sitebrew-api#288 decision D14: one Hugo version platform-wide, the
+      # executor image already verifies on 0.161). Evidence before the bump:
+      # all 8 real/production sites plus the canary build on 0.161.0 extended
+      # with exit 0 (sitebrew-api#311) — the only output diffs come from the
+      # newer minifier, and the two new `WARN deprecated` lines
+      # (`languageCode` -> `locale`, `.Language.LanguageCode` ->
+      # `.Language.Locale`) are non-fatal. Also the floor for the opt-in
+      # `css.TailwindCSS` step below, so a Tailwind site no longer needs its
+      # own `with: hugo-version:` override — still honoured if a caller pins
+      # one on purpose.
       hugo-version:
+        description: "Hugo version installed for `build` and `cleanup-build` (extended build)"
         type: string
-        default: "0.147.0"
+        default: "0.161.0"
 
 # Every action this workflow calls, SHA-pinned — a `<site-actions>`-calling
 # repository's own `selected actions` allowlist has to name each of these
