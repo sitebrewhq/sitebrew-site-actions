@@ -23,6 +23,10 @@ permissions:
 jobs:
   deploy:
     uses: sitebrewhq/sitebrew-site-actions/.github/workflows/build.yml@<pinned-sha>
+    # Optional — Hugo defaults to 0.161.0 (extended); pin only if a site
+    # needs something else:
+    # with:
+    #   hugo-version: "0.161.0"
 ```
 
 All three matter even for a push-only caller: `id-token: write` is required
@@ -82,8 +86,8 @@ path for no gain over rebuilding the same commit. It then calls
 
 `build` and `cleanup-build` each run `npm ci` before `hugo` whenever the site
 repository has a `package-lock.json` (the file `npm ci` itself requires, not
-just `package.json`) — a no-op, zero-cost step for a site that doesn't. This
-is what a site needs to use Hugo's `css.TailwindCSS` function
+just `package.json`) — a no-op, zero-cost step for a site that doesn't. This,
+plus the default Hugo `0.161.0`, is what a site needs to use Hugo's `css.TailwindCSS` function
 (https://gohugo.io/functions/css/tailwindcss/), useful in particular when
 migrating a page from an original Tailwind-based site and wanting to reuse
 its utility classes close to verbatim instead of hand-translating them into
@@ -95,23 +99,37 @@ R2 credential. To opt in, a site repo adds:
 
 1. A `package.json` **and committed `package-lock.json`** with
    `tailwindcss`/`@tailwindcss/cli` as dependencies.
-2. `with: hugo-version: "0.161.0"` (or newer) on its own `build.yml`'s call
-   into this workflow — the default here intentionally stays below that
-   floor so the ~170 sites that don't use this feature see no Hugo version
-   change. As of Hugo v0.161.0 the Tailwind *standalone binary* is no longer
-   supported; the CLI must come from npm, which is exactly what the new step
-   above installs.
-3. Its own `hugo.toml` additions (`security.exec.allow` for `tailwindcss`/
-   `node`/`postcss`, `build.buildStats`, and the `hugo_stats.json` module
-   mount) and a `layouts/_partials/css.html` using `templates.Defer` — see
-   Hugo's own docs page above for the exact snippet; this repo has no
-   central `hugo.toml` to change it in, since that file lives in each site.
+2. Nothing for the Hugo version: this workflow's `hugo-version` input
+   defaults to `0.161.0` (bumped from `0.147.0` on 2026-10-08, `sitebrew-api`
+   decision D14 in issue #288, verified against every real site in issue
+   #311), which already satisfies `css.TailwindCSS`'s floor. A site that
+   needs a different version can still pass `with: hugo-version: "<x.y.z>"`
+   on its own `build.yml`'s call into this workflow — the override is
+   honoured as-is. As of Hugo v0.161.0 the Tailwind *standalone binary* is
+   no longer supported; the CLI must come from npm, which is exactly what
+   the step above installs.
+3. Its own `hugo.toml` additions (`build.buildStats`, the `hugo_stats.json`
+   module mount, and `security.exec.allow`) and a `layouts/_partials/css.html`
+   using `templates.Defer` — see Hugo's own docs page above for the exact
+   snippet; this repo has no central `hugo.toml` to change it in, since that
+   file lives in each site. One correction to the snippet as Hugo documents
+   it: the `security.exec.allow` regex **must include `node`**, because Hugo
+   ≥0.161 spawns `node` itself to run the Tailwind CLI (found in the
+   `sitebrew-api` #299 theme prototype — the `^(go|npm|npx|tailwindcss)$`
+   form fails the build):
 
-Not currently supported: agent-driven (`sitebrew-executor`) edits to a
-Tailwind-opted-in site. That sandbox denies `npm install`/`npx` at runtime by
-design and doesn't bake in a `tailwindcss` CLI, so a `hugo` preview build
-inside a `site_change` job would fail on such a site — out of scope here,
-tracked in issue #14.
+   ```toml
+   [security]
+     [security.exec]
+       allow = ['^(go|node|npm|npx|tailwindcss)$']
+   ```
+
+Agent-driven (`sitebrew-executor`) edits to a Tailwind-opted-in site: the
+executor sandbox still denies `npm install`/`npx` at runtime by design, but
+since executor v0.1.7 (2026-10-07) its image bakes in the `tailwindcss` CLI,
+so a `hugo` preview build inside a `site_change` job no longer fails for lack
+of the binary. The site's `security.exec.allow` above must match on both
+sides, since the executor runs the same `hugo` build. History: issue #14.
 
 ## The `stable` tag and `promote.yml`
 
