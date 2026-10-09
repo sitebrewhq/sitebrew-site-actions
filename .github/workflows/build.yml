@@ -34,7 +34,7 @@ on:
       api-base-url:
         description: "Base URL of the sitebrew-api stage this run publishes to"
         type: string
-        default: "https://api-staging.sitebrew.app"
+        default: "https://api.staging.sitebrew.app"
       oidc-audience:
         description: "Must match sitebrew-api's ACTIONS_OIDC_AUDIENCE for that stage (sitebrew-actions-<stage>)"
         type: string
@@ -195,7 +195,7 @@ jobs:
           # to the same value on purpose" with what a workflow_call input
           # exposes — the two are handled identically either way, so the
           # ambiguity costs nothing.
-          if [ "${CALLER_API_BASE_URL}" != "https://api-staging.sitebrew.app" ] || [ "${CALLER_OIDC_AUDIENCE}" != "sitebrew-actions-staging" ]; then
+          if [ "${CALLER_API_BASE_URL}" != "https://api.staging.sitebrew.app" ] || [ "${CALLER_OIDC_AUDIENCE}" != "sitebrew-actions-staging" ]; then
             api_base_url="${CALLER_API_BASE_URL}"
             oidc_audience="${CALLER_OIDC_AUDIENCE}"
           elif [ "${stage}" = "production" ]; then
@@ -471,7 +471,7 @@ jobs:
             stage="staging"
           fi
 
-          if [ "${CALLER_API_BASE_URL}" != "https://api-staging.sitebrew.app" ] || [ "${CALLER_OIDC_AUDIENCE}" != "sitebrew-actions-staging" ]; then
+          if [ "${CALLER_API_BASE_URL}" != "https://api.staging.sitebrew.app" ] || [ "${CALLER_OIDC_AUDIENCE}" != "sitebrew-actions-staging" ]; then
             api_base_url="${CALLER_API_BASE_URL}"
             oidc_audience="${CALLER_OIDC_AUDIENCE}"
           elif [ "${stage}" = "production" ]; then

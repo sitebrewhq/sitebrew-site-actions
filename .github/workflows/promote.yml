@@ -70,7 +70,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  API_BASE_URL: https://api-staging.sitebrew.app
+  API_BASE_URL: https://api.staging.sitebrew.app
   # Must match sitebrew-api's ACTIONS_OIDC_AUDIENCE for that stage — the
   # same value `build.yml`'s own `oidc-audience` input defaults to.
   # `/canary-token` verifies this token against the *same* audience
