@@ -12,14 +12,14 @@ test("waitForCandidateStatus resolves success as soon as a terminal state appear
   let fetchCalls = 0;
   const sleeps = [];
   const conclusion = await waitForCandidateStatus({
-    apiBaseUrl: "https://api-staging.sitebrew.app",
+    apiBaseUrl: "https://api.staging.sitebrew.app",
     audience: "sitebrew-actions-staging",
     sha: "cafef00d",
     maxAttempts: 5,
     mintToken: mint.mintToken,
     fetchImpl: async (url, init) => {
       fetchCalls += 1;
-      assert.equal(url, "https://api-staging.sitebrew.app/v1/actions/canary-status");
+      assert.equal(url, "https://api.staging.sitebrew.app/v1/actions/canary-status");
       assert.equal(init.method, "POST");
       assert.equal(init.headers.authorization, `Bearer t${fetchCalls}`);
       assert.deepEqual(JSON.parse(init.body), { sha: "cafef00d" });
@@ -38,7 +38,7 @@ test("waitForCandidateStatus reports failure without waiting out the rest of max
   const mint = fakeMintToken();
   let calls = 0;
   const conclusion = await waitForCandidateStatus({
-    apiBaseUrl: "https://api-staging.sitebrew.app",
+    apiBaseUrl: "https://api.staging.sitebrew.app",
     audience: "a",
     sha: "s",
     maxAttempts: 10,
@@ -60,7 +60,7 @@ test("waitForCandidateStatus gives up and reports timeout after maxAttempts, sle
   let sleepCount = 0;
   let fetchCount = 0;
   const conclusion = await waitForCandidateStatus({
-    apiBaseUrl: "https://api-staging.sitebrew.app",
+    apiBaseUrl: "https://api.staging.sitebrew.app",
     audience: "a",
     sha: "s",
     maxAttempts: 3,
@@ -82,7 +82,7 @@ test("waitForCandidateStatus throws on a non-ok response instead of treating it 
   const mint = fakeMintToken();
   await assert.rejects(
     waitForCandidateStatus({
-      apiBaseUrl: "https://api-staging.sitebrew.app",
+      apiBaseUrl: "https://api.staging.sitebrew.app",
       audience: "a",
       sha: "s",
       mintToken: mint.mintToken,
