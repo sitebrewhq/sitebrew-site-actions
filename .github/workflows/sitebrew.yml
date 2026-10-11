@@ -3,10 +3,19 @@ name: sitebrew-opt-in
 # Only callers that explicitly name this workflow use the pinned builder path.
 on:
   workflow_call:
+    inputs:
+      api-base-url:
+        description: "Base URL of the sitebrew-api stage this run publishes to"
+        type: string
+        default: "https://api.staging.sitebrew.app"
+      oidc-audience:
+        description: "Audience expected by that sitebrew-api stage"
+        type: string
+        default: "sitebrew-actions-staging"
 
 jobs:
   identify:
-    if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'pull_request' && github.event.action != 'closed')
+    if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'pull_request'
     runs-on: [self-hosted, linux, x64, railway]
     permissions:
       id-token: write
@@ -36,6 +45,7 @@ jobs:
       - name: Checkout site
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.2.2
         with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.action == 'closed' && github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
       - name: Checkout reviewed validator and release mapping
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.2.2
@@ -52,6 +62,7 @@ jobs:
 
   build:
     needs: resolve
+    if: github.event_name != 'pull_request' || github.event.action != 'closed'
     runs-on: [self-hosted, linux, x64, railway]
     container:
       image: ${{ needs.resolve.outputs.image }}
@@ -74,7 +85,7 @@ jobs:
           else
             /usr/local/bin/hugo-real --gc
           fi
-      - name: Save build output for the OIDC publish job
+      - name: Save build output for publish
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: public
@@ -85,13 +96,453 @@ jobs:
         run: |
           echo "source_sha=$GITHUB_SHA image=$IMAGE" >> "$GITHUB_STEP_SUMMARY"
 
-  publish:
+  deploy:
     needs: build
-    if: always() && (needs.build.result == 'success' || (github.event_name == 'pull_request' && github.event.action == 'closed'))
+    if: needs.build.result == 'success'
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    permissions:
+      contents: read
+      # The one thing this job needs that the build job must not have:
+      # GitHub's own short-lived OIDC identity token, traded for an R2
+      # upload credential scoped to exactly this repository's prefix. No
+      # Cloudflare secret is ever configured on this repository or its
+      # caller (design/0005 §8's job split — untrusted `hugo` build stays
+      # in the credential-free `build` job above).
+      id-token: write
+      # Only used by "Comment preview URL" below, and only on a pull_request
+      # run — a production push never reaches that step.
+      pull-requests: write
+    steps:
+      - name: Resolve this run's target stage
+        id: resolve-stage
+        env:
+          STAGE_VARIABLE: ${{ vars.STAGE }}
+          CALLER_API_BASE_URL: ${{ inputs.api-base-url }}
+          CALLER_OIDC_AUDIENCE: ${{ inputs.oidc-audience }}
+        run: |
+          set -euo pipefail
+          repo_name="${GITHUB_REPOSITORY#*/}"
+
+          # Signal 1 (primary): the repository's own name is stage-authoritative
+          # platform-wide (sitebrew-api's repository-name.ts, ADR-0003) —
+          # production gets the bare `site-<32-hex-id>`, every other stage gets
+          # `<stage>-site-<32-hex-id>`. Anchored, exact-match regexes only: a
+          # loose `startsWith` check would false-match an unrelated repository
+          # whose name happens to start with "site-" (e.g. sitebrewhq/site-actions
+          # is not a site repo at all, and would otherwise misread as production).
+          name_stage="unknown"
+          if [[ "${repo_name}" =~ ^site-[0-9a-f]{32}$ ]]; then
+            name_stage="production"
+          elif [[ "${repo_name}" =~ ^staging-site-[0-9a-f]{32}$ ]]; then
+            name_stage="staging"
+          fi
+
+          # Signal 2 (secondary, independent): the plain, non-secret `STAGE`
+          # repository Actions variable sitebrew-api's `create()` writes onto
+          # every repository it forks, as of 2026-09-08 (`github.ts`'s own
+          # `setStageVariable` doc explains why a bare stage name does not
+          # reopen the 2026-09-02 removal of the real Cloudflare-credential
+          # writes). Absent on every repository forked before this existed —
+          # the only reason this stays optional rather than required below.
+          # `vars.*` inside a called (`workflow_call`) workflow resolves
+          # against the CALLING repository's own variables, not this
+          # repository's — confirmed against GitHub's "Reusing workflow
+          # configurations" docs before this was written, since getting that
+          # backwards would make the whole cross-check silently useless.
+          variable_stage="${STAGE_VARIABLE:-}"
+
+          if [ -n "${variable_stage}" ] && [ "${name_stage}" != "unknown" ] && [ "${variable_stage}" != "${name_stage}" ]; then
+            echo "::error::Stage mismatch for ${GITHUB_REPOSITORY}: the repository name implies '${name_stage}', but its STAGE repository variable says '${variable_stage}'. Refusing to guess which is right — the name is set once at fork time (sitebrew-api's repository-name.ts) and the variable is written by that same create() call, so a real disagreement means one of them was edited by hand after the fact."
+            exit 1
+          fi
+
+          if [ -n "${variable_stage}" ]; then
+            stage="${variable_stage}"
+          elif [ "${name_stage}" != "unknown" ]; then
+            stage="${name_stage}"
+          else
+            # Safe default (Jakub, 2026-09-08, thread 1788779979.326759):
+            # anything ambiguous or unrecognized, with no variable to fall
+            # back on either, resolves to staging — never production. A real
+            # production site 404s visibly rather than a test accidentally
+            # touching real customer data.
+            stage="staging"
+          fi
+
+          # The caller's own `with:` override, if it gave one, wins outright —
+          # this step only replaces the *default* value nobody overrode
+          # (every site repo's own build.yml does exactly that today, which is
+          # the actual bug this step exists to fix), never a deliberate
+          # explicit choice. Comparing against the known staging default is
+          # the only way to tell "left at default" apart from "explicitly set
+          # to the same value on purpose" with what a workflow_call input
+          # exposes — the two are handled identically either way, so the
+          # ambiguity costs nothing.
+          if [ "${CALLER_API_BASE_URL}" != "https://api.staging.sitebrew.app" ] || [ "${CALLER_OIDC_AUDIENCE}" != "sitebrew-actions-staging" ]; then
+            api_base_url="${CALLER_API_BASE_URL}"
+            oidc_audience="${CALLER_OIDC_AUDIENCE}"
+          elif [ "${stage}" = "production" ]; then
+            api_base_url="https://api.sitebrew.app"
+            oidc_audience="sitebrew-actions-production"
+          else
+            api_base_url="${CALLER_API_BASE_URL}"
+            oidc_audience="${CALLER_OIDC_AUDIENCE}"
+          fi
+
+          echo "Resolved stage=${stage} (name=${name_stage}, variable=${variable_stage:-<absent>}) api-base-url=${api_base_url}"
+          echo "stage=${stage}" >> "$GITHUB_OUTPUT"
+          echo "api-base-url=${api_base_url}" >> "$GITHUB_OUTPUT"
+          echo "oidc-audience=${oidc_audience}" >> "$GITHUB_OUTPUT"
+
+      # `fail-on-cache-miss`: the `build` job's own `Save build output to
+      # cache` step ran under the same `github.run_id`, so a miss here means
+      # something actually went wrong (build failed silently, or the two
+      # jobs somehow disagree on the key) rather than a legitimate "nothing
+      # to deploy" — surface that as a hard failure instead of uploading
+      # whatever happens to be in an empty `public/`.
+      - name: Restore build output from cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: public
+          key: site-build-${{ github.run_id }}
+          fail-on-cache-miss: true
+
+      - name: Request GitHub OIDC token
+        id: oidc
+        env:
+          AUDIENCE: ${{ steps.resolve-stage.outputs.oidc-audience }}
+        run: |
+          set -euo pipefail
+          resp=$(curl -sSf -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${AUDIENCE}")
+          token=$(node -e 'process.stdout.write(JSON.parse(require("fs").readFileSync(0,"utf8")).value)' <<<"$resp")
+          echo "::add-mask::${token}"
+          echo "token=${token}" >> "$GITHUB_OUTPUT"
+
+      - name: Mint R2 upload credential
+        id: mint
+        env:
+          API_BASE_URL: ${{ steps.resolve-stage.outputs.api-base-url }}
+          OIDC_TOKEN: ${{ steps.oidc.outputs.token }}
+        run: |
+          set -euo pipefail
+          resp=$(curl -sSf -X POST "${API_BASE_URL}/v1/actions/upload-token" \
+            -H "Authorization: Bearer ${OIDC_TOKEN}")
+          node -e '
+            const c = JSON.parse(require("fs").readFileSync(0, "utf8"));
+            for (const k of ["accessKeyId", "secretAccessKey", "sessionToken"]) {
+              console.log(`::add-mask::${c[k]}`);
+            }
+            const out = process.env.GITHUB_OUTPUT;
+            const fs = require("fs");
+            for (const k of ["accessKeyId", "secretAccessKey", "sessionToken", "accountId", "bucket", "prefix"]) {
+              fs.appendFileSync(out, `${k}=${c[k]}\n`);
+            }
+          ' <<<"$resp"
+
+      - name: Resolve this reusable workflow's own repository and ref
+        # Neither `github.workflow_ref` (names the CALLER's own workflow
+        # file even inside a called job — verified live 2026-09-01: checked
+        # out the calling site repo, MODULE_NOT_FOUND) nor
+        # `github.job_workflow_ref` (not a real expression context property
+        # at all — verified live 2026-09-01: evaluates to an empty string,
+        # no error) gives this repository's own pinned ref from inside its
+        # own job. `job_workflow_ref` only exists as an OIDC token CLAIM
+        # (the same one `authorizeActionsRun` verifies server-side) — decode
+        # it from the token already minted above instead. Needed to check
+        # out `scripts/upload-to-r2.mjs` at the exact reviewed revision this
+        # run was invoked at, not whatever `main` happens to hold right now.
+        id: self
+        env:
+          OIDC_TOKEN: ${{ steps.oidc.outputs.token }}
+        run: |
+          set -euo pipefail
+          WORKFLOW_REF=$(node -e '
+            const payload = JSON.parse(Buffer.from(process.env.OIDC_TOKEN.split(".")[1], "base64url").toString("utf8"));
+            process.stdout.write(payload.job_workflow_ref);
+          ')
+          repo="${WORKFLOW_REF%%/.github/workflows/*}"
+          ref="${WORKFLOW_REF##*@}"
+          echo "repo=${repo}" >> "$GITHUB_OUTPUT"
+          echo "ref=${ref}" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout sitebrew-site-actions (scripts)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.2.2
+        with:
+          repository: ${{ steps.self.outputs.repo }}
+          ref: ${{ steps.self.outputs.ref }}
+          path: .site-actions
+          sparse-checkout: scripts
+
+      - name: Upload site to R2
+        id: upload
+        env:
+          R2_ACCOUNT_ID: ${{ steps.mint.outputs.accountId }}
+          R2_BUCKET: ${{ steps.mint.outputs.bucket }}
+          R2_PREFIX: ${{ steps.mint.outputs.prefix }}
+          R2_ACCESS_KEY_ID: ${{ steps.mint.outputs.accessKeyId }}
+          R2_SECRET_ACCESS_KEY: ${{ steps.mint.outputs.secretAccessKey }}
+          R2_SESSION_TOKEN: ${{ steps.mint.outputs.sessionToken }}
+          SITE_DIR: public
+        run: node .site-actions/scripts/upload-to-r2.mjs
+
+      # No cleanup step here anymore (2026-09-24, sa#242): `public/` now
+      # travels via `actions/cache`, not `actions/upload-artifact`, so there
+      # is no GitHub Actions *artifact* left behind for
+      # `sitebrew-api`'s `/v1/actions/artifact-cleanup` to delete — calling
+      # it would just look up this run's artifact list, find it empty, and
+      # no-op. Cache entries fall under a separate, per-repository 10 GB
+      # quota with GitHub's own automatic (LRU / 7-day-unused) eviction, the
+      # crowding problem this replaces `upload-artifact` for in the first
+      # place — no equivalent active cleanup is needed.
+
+      # Closes the `publishJob` row `publishChange` opened for this run
+      # (`publish-job-status-fix`, 2026-09-02, MEM-475) — without this,
+      # `get_job`/`get_site` read that row stuck at "queued" forever, because
+      # the only prior writer (`PublishJobWorkflow`, the container-based
+      # `design/0005` path) never runs on this Actions/R2 path. `if: always()`
+      # so a failed build/mint/upload is reported too, not only a success —
+      # otherwise a failure leaves the exact same stuck-forever row this step
+      # exists to close. Never fails the job itself: `public/` already landed
+      # in R2 or it didn't by the time this runs, and a callback hiccup must
+      # not flip that verdict. Production only — a pull-request preview has no
+      # `publishJob` row (see `sitebrew-api`'s `actions-oidc-routes.ts` top
+      # note for why `/publish-callback` stays separate from
+      # `/deploy-callback` below).
+      - name: Report publish result
+        if: always() && github.event_name == 'push'
+        env:
+          API_BASE_URL: ${{ steps.resolve-stage.outputs.api-base-url }}
+          OIDC_TOKEN: ${{ steps.oidc.outputs.token }}
+          UPLOAD_OUTCOME: ${{ steps.upload.outcome }}
+        run: |
+          if [ -z "${OIDC_TOKEN}" ]; then
+            echo "::warning::No OIDC token minted — cannot report publish result"
+            exit 0
+          fi
+          if [ "${UPLOAD_OUTCOME}" = "success" ]; then
+            body='{"ok": true}'
+          else
+            body='{"ok": false, "explanation": "the Actions run failed before or during the R2 upload", "causedBy": "us"}'
+          fi
+          status=$(curl -sS -o /tmp/publish-callback-response.json -w '%{http_code}' -X POST "${API_BASE_URL}/v1/actions/publish-callback" \
+            -H "Authorization: Bearer ${OIDC_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "${body}")
+          if [ "${status}" -ge 300 ]; then
+            echo "::warning::publish-callback returned HTTP ${status}: $(cat /tmp/publish-callback-response.json)"
+          fi
+
+      # Production resolves its hostname through `sitebrew-worker`'s own
+      # `hostMetadata` (custom hostname) — no KV involved, so this and the
+      # comment step below only run for a pull-request preview.
+      - name: Record preview hostname
+        id: preview
+        if: github.event_name == 'pull_request'
+        env:
+          API_BASE_URL: ${{ steps.resolve-stage.outputs.api-base-url }}
+          OIDC_TOKEN: ${{ steps.oidc.outputs.token }}
+        run: |
+          set -euo pipefail
+          resp=$(curl -sSf -X POST "${API_BASE_URL}/v1/actions/deploy-callback" \
+            -H "Authorization: Bearer ${OIDC_TOKEN}")
+          node -e '
+            const c = JSON.parse(require("fs").readFileSync(0, "utf8"));
+            require("fs").appendFileSync(process.env.GITHUB_OUTPUT, `hostname=${c.hostname}\n`);
+          ' <<<"$resp"
+
+      - name: Comment preview URL
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        with:
+          script: |
+            const host = "${{ steps.preview.outputs.hostname }}";
+            const marker = "<!-- sitebrew-preview -->";
+            const body = `${marker}\n🌐 **Sitebrew preview:** https://${host}/`;
+            const { data: comments } = await github.rest.issues.listComments({ ...context.repo, issue_number: context.issue.number });
+            const existing = comments.find((c) => c.body.includes(marker));
+            if (existing) await github.rest.issues.updateComment({ ...context.repo, comment_id: existing.id, body });
+            else await github.rest.issues.createComment({ ...context.repo, issue_number: context.issue.number, body });
+
+  cleanup-build:
+    needs: resolve
+    if: github.event_name == 'pull_request' && github.event.action == 'closed'
+    runs-on: [self-hosted, linux, x64, railway]
+    container:
+      image: ${{ needs.resolve.outputs.image }}
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout closed PR head
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.2.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - name: Build deletion list in the recorded image
+        env:
+          USE_NPM: ${{ needs.resolve.outputs.npm }}
+          MINIFY: ${{ needs.resolve.outputs.minify }}
+        run: |
+          set -euo pipefail
+          if [ "$USE_NPM" = true ]; then npm ci --ignore-scripts; fi
+          if [ "$MINIFY" = true ]; then
+            /usr/local/bin/hugo-real --gc --minify
+          else
+            /usr/local/bin/hugo-real --gc
+          fi
+      - name: Save deletion list for cleanup
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: public
+          key: cleanup-build-${{ github.run_id }}
+
+  cleanup:
+    needs: cleanup-build
+    if: needs.cleanup-build.result == 'success'
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     permissions:
       contents: read
       id-token: write
-      pull-requests: write
-    uses: ./.github/workflows/build.yml
-    with:
-      prebuilt-cache-key: ${{ github.event.action != 'closed' && format('site-build-{0}', github.run_id) || '' }}
+    steps:
+      # Same two-signal resolution as the `deploy` job's own step of the same
+      # name — see that one for the full design comment. Duplicated rather
+      # than factored out because this workflow has no internal composite
+      # action today and every other step already duplicates this way between
+      # `deploy` and `cleanup` (OIDC request, credential mint, self-checkout).
+      - name: Resolve this run's target stage
+        id: resolve-stage
+        env:
+          STAGE_VARIABLE: ${{ vars.STAGE }}
+          CALLER_API_BASE_URL: ${{ inputs.api-base-url }}
+          CALLER_OIDC_AUDIENCE: ${{ inputs.oidc-audience }}
+        run: |
+          set -euo pipefail
+          repo_name="${GITHUB_REPOSITORY#*/}"
+
+          name_stage="unknown"
+          if [[ "${repo_name}" =~ ^site-[0-9a-f]{32}$ ]]; then
+            name_stage="production"
+          elif [[ "${repo_name}" =~ ^staging-site-[0-9a-f]{32}$ ]]; then
+            name_stage="staging"
+          fi
+
+          variable_stage="${STAGE_VARIABLE:-}"
+
+          if [ -n "${variable_stage}" ] && [ "${name_stage}" != "unknown" ] && [ "${variable_stage}" != "${name_stage}" ]; then
+            echo "::error::Stage mismatch for ${GITHUB_REPOSITORY}: the repository name implies '${name_stage}', but its STAGE repository variable says '${variable_stage}'. Refusing to guess which is right — the name is set once at fork time (sitebrew-api's repository-name.ts) and the variable is written by that same create() call, so a real disagreement means one of them was edited by hand after the fact."
+            exit 1
+          fi
+
+          if [ -n "${variable_stage}" ]; then
+            stage="${variable_stage}"
+          elif [ "${name_stage}" != "unknown" ]; then
+            stage="${name_stage}"
+          else
+            stage="staging"
+          fi
+
+          if [ "${CALLER_API_BASE_URL}" != "https://api.staging.sitebrew.app" ] || [ "${CALLER_OIDC_AUDIENCE}" != "sitebrew-actions-staging" ]; then
+            api_base_url="${CALLER_API_BASE_URL}"
+            oidc_audience="${CALLER_OIDC_AUDIENCE}"
+          elif [ "${stage}" = "production" ]; then
+            api_base_url="https://api.sitebrew.app"
+            oidc_audience="sitebrew-actions-production"
+          else
+            api_base_url="${CALLER_API_BASE_URL}"
+            oidc_audience="${CALLER_OIDC_AUDIENCE}"
+          fi
+
+          echo "Resolved stage=${stage} (name=${name_stage}, variable=${variable_stage:-<absent>}) api-base-url=${api_base_url}"
+          echo "stage=${stage}" >> "$GITHUB_OUTPUT"
+          echo "api-base-url=${api_base_url}" >> "$GITHUB_OUTPUT"
+          echo "oidc-audience=${oidc_audience}" >> "$GITHUB_OUTPUT"
+
+      # Restored from `cleanup-build`'s cache rather than rebuilt here — this
+      # job holds `id-token: write`, so it must never run the site repo's own
+      # code (Hugo templates, and especially an opt-in `npm ci`) itself. See
+      # `cleanup-build`'s own comment above for why that split exists.
+      - name: Restore build output from cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: public
+          key: cleanup-build-${{ github.run_id }}
+          fail-on-cache-miss: true
+
+      - name: Request GitHub OIDC token
+        id: oidc
+        env:
+          AUDIENCE: ${{ steps.resolve-stage.outputs.oidc-audience }}
+        run: |
+          set -euo pipefail
+          resp=$(curl -sSf -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${AUDIENCE}")
+          token=$(node -e 'process.stdout.write(JSON.parse(require("fs").readFileSync(0,"utf8")).value)' <<<"$resp")
+          echo "::add-mask::${token}"
+          echo "token=${token}" >> "$GITHUB_OUTPUT"
+
+      - name: Mint R2 delete credential
+        id: mint
+        env:
+          API_BASE_URL: ${{ steps.resolve-stage.outputs.api-base-url }}
+          OIDC_TOKEN: ${{ steps.oidc.outputs.token }}
+        run: |
+          set -euo pipefail
+          resp=$(curl -sSf -X POST "${API_BASE_URL}/v1/actions/upload-token" \
+            -H "Authorization: Bearer ${OIDC_TOKEN}")
+          node -e '
+            const c = JSON.parse(require("fs").readFileSync(0, "utf8"));
+            for (const k of ["accessKeyId", "secretAccessKey", "sessionToken"]) {
+              console.log(`::add-mask::${c[k]}`);
+            }
+            const out = process.env.GITHUB_OUTPUT;
+            const fs = require("fs");
+            for (const k of ["accessKeyId", "secretAccessKey", "sessionToken", "accountId", "bucket", "prefix"]) {
+              fs.appendFileSync(out, `${k}=${c[k]}\n`);
+            }
+          ' <<<"$resp"
+
+      - name: Resolve this reusable workflow's own repository and ref
+        # See the `deploy` job's own copy of this step for why this decodes
+        # the OIDC token's `job_workflow_ref` claim instead of using a
+        # `github.*` context expression.
+        id: self
+        env:
+          OIDC_TOKEN: ${{ steps.oidc.outputs.token }}
+        run: |
+          set -euo pipefail
+          WORKFLOW_REF=$(node -e '
+            const payload = JSON.parse(Buffer.from(process.env.OIDC_TOKEN.split(".")[1], "base64url").toString("utf8"));
+            process.stdout.write(payload.job_workflow_ref);
+          ')
+          repo="${WORKFLOW_REF%%/.github/workflows/*}"
+          ref="${WORKFLOW_REF##*@}"
+          echo "repo=${repo}" >> "$GITHUB_OUTPUT"
+          echo "ref=${ref}" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout sitebrew-site-actions (scripts)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.2.2
+        with:
+          repository: ${{ steps.self.outputs.repo }}
+          ref: ${{ steps.self.outputs.ref }}
+          path: .site-actions
+          sparse-checkout: scripts
+
+      - name: Delete preview from R2
+        env:
+          R2_ACCOUNT_ID: ${{ steps.mint.outputs.accountId }}
+          R2_BUCKET: ${{ steps.mint.outputs.bucket }}
+          R2_PREFIX: ${{ steps.mint.outputs.prefix }}
+          R2_ACCESS_KEY_ID: ${{ steps.mint.outputs.accessKeyId }}
+          R2_SECRET_ACCESS_KEY: ${{ steps.mint.outputs.secretAccessKey }}
+          R2_SESSION_TOKEN: ${{ steps.mint.outputs.sessionToken }}
+          SITE_DIR: public
+        run: node .site-actions/scripts/delete-from-r2.mjs
+
+      - name: Remove preview hostname
+        env:
+          API_BASE_URL: ${{ steps.resolve-stage.outputs.api-base-url }}
+          OIDC_TOKEN: ${{ steps.oidc.outputs.token }}
+        run: |
+          set -euo pipefail
+          curl -sSf -X DELETE "${API_BASE_URL}/v1/actions/deploy-callback" \
+            -H "Authorization: Bearer ${OIDC_TOKEN}" >/dev/null
