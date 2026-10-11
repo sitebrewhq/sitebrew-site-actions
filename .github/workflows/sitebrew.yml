@@ -97,7 +97,7 @@ jobs:
           echo "source_sha=$GITHUB_SHA image=$IMAGE" >> "$GITHUB_STEP_SUMMARY"
 
   deploy:
-    needs: build
+    needs: [build, resolve]
     if: needs.build.result == 'success'
     runs-on: blacksmith-2vcpu-ubuntu-2404
     permissions:
@@ -276,7 +276,11 @@ jobs:
 
       - name: Upload site to R2
         id: upload
+        # This separate runner cannot inherit processes left by the site build.
+        # The reviewed uploader writes and verifies the marker before R2 upload.
         env:
+          EXPECTED_SOURCE_COMMIT: ${{ github.sha }}
+          EXPECTED_IMAGE_DIGEST: ${{ needs.resolve.outputs.digest }}
           R2_ACCOUNT_ID: ${{ steps.mint.outputs.accountId }}
           R2_BUCKET: ${{ steps.mint.outputs.bucket }}
           R2_PREFIX: ${{ steps.mint.outputs.prefix }}
