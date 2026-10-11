@@ -54,6 +54,10 @@ on:
         description: "Hugo version installed for `build` and `cleanup-build` (extended build)"
         type: string
         default: "0.161.0"
+      prebuilt-cache-key:
+        description: "Internal: cache key produced by the opt-in digest-pinned workflow"
+        type: string
+        default: ""
 
 # Every action this workflow calls, SHA-pinned — a `<site-actions>`-calling
 # repository's own `selected actions` allowlist has to name each of these
@@ -63,7 +67,7 @@ on:
 # minimal.
 jobs:
   build:
-    if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'pull_request' && github.event.action != 'closed')
+    if: inputs.prebuilt-cache-key == '' && ((github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'pull_request' && github.event.action != 'closed'))
     runs-on: blacksmith-2vcpu-ubuntu-2404
     permissions:
       contents: read
@@ -116,6 +120,7 @@ jobs:
 
   deploy:
     needs: build
+    if: always() && (needs.build.result == 'success' || (inputs.prebuilt-cache-key != '' && ((github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'pull_request' && github.event.action != 'closed'))))
     runs-on: blacksmith-2vcpu-ubuntu-2404
     permissions:
       contents: read
@@ -221,7 +226,7 @@ jobs:
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: public
-          key: site-build-${{ github.run_id }}
+          key: ${{ inputs.prebuilt-cache-key || format('site-build-{0}', github.run_id) }}
           fail-on-cache-miss: true
 
       - name: Request GitHub OIDC token
