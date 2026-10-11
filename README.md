@@ -248,3 +248,15 @@ include a frozen-reference-signature test: the hand-rolled SigV4 signer's
 output for a fixed request/date is checked against a signature independently
 computed with the `aws4` npm package, so a regression fails a test rather
 than only failing silently against a live R2 endpoint.
+
+### Serving proof marker
+
+Both reusable publish builds place `public/.sitebrew/build.json` in the uploaded
+artifact. It contains `sourceCommit` (the checked-out push SHA) and
+`imageDigest` (the validated pinned digest for `sitebrew.yml`, or `null` for
+legacy `build.yml`). The platform reads that path through the site's public
+hostname after observing Actions success; the marker must match before the
+change becomes published. Rollback reruns the earlier commit's Actions run and
+therefore uploads that commit's marker again. The marker is generated in the
+credential-free build job before its output is cached, so the deploy job uploads
+exactly the artifact that was built.

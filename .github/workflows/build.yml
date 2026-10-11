@@ -92,6 +92,14 @@ jobs:
         run: npm ci
       - name: Build
         run: hugo --gc --minify
+      - name: Emit serving marker
+        run: |
+          node --input-type=module -e '
+            import { mkdirSync, writeFileSync } from "node:fs";
+            if (!/^[0-9a-f]{40}$/i.test(process.env.GITHUB_SHA ?? "")) throw new Error("invalid source SHA");
+            mkdirSync("public/.sitebrew", { recursive: true });
+            writeFileSync("public/.sitebrew/build.json", JSON.stringify({ sourceCommit: process.env.GITHUB_SHA.toLowerCase(), imageDigest: null }) + "\n");
+          '
 
       # `actions/cache`, not `actions/upload-artifact`: the org-wide GitHub
       # Actions *artifact storage* quota (distinct from the compute-minute
