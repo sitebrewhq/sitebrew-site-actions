@@ -23,3 +23,11 @@ test("rejects unknown keys, floating images, missing releases and nonboolean opt
     assert.throws(() => resolveConfig(source, mapping));
   }
 });
+
+test("refuses all builders before the platform has recorded a release", () => {
+  const unreleased = JSON.stringify({ schemaVersion: 1, releases: {} });
+  for (const builder of ["release: v1.2.3", `image: ghcr.io/sitebrewhq/sitebrew-executor@${digest}`]) {
+    assert.throws(() => resolveConfig(config(builder), unreleased),
+      /platform has not published a builder image yet.*builder-image\.json.*builder-images\.json/);
+  }
+});

@@ -24,6 +24,9 @@ export function resolveConfig(source, mappingSource) {
   for (const [release, digest] of Object.entries(mapping.releases)) {
     if (!RELEASE.test(release) || typeof digest !== "string" || !DIGEST.test(digest)) throw new Error("invalid release mapping entry");
   }
+  if (Object.keys(mapping.releases).length === 0) {
+    throw new Error("The platform has not published a builder image yet. An owner must publish a builder-image.json release and record its releaseTag and digest in builder-images.json before this workflow can run.");
+  }
   let digest;
   if ("image" in config.builder) {
     const image = config.builder.image;

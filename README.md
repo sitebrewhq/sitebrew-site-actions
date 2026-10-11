@@ -9,9 +9,12 @@ Actions-publish model.
 
 ### Opt-in digest-pinned builder (4-02)
 
-After the owner has published a 4-01 `builder-image.json` release, copied its
-`releaseTag` and `digest` into the committed `builder-images.json` map here,
-and exercised this path on the canary, a site can opt in by adding a
+`builder-images.json` remains empty until the platform publishes an
+owner-gated `builder-image.json` release. An owner copies that release's
+`releaseTag` and `digest` into this committed map and exercises the new path
+on the canary. Until then, validation refuses every builder with a clear
+"platform has not published a builder image yet" error. Once a release is
+recorded, a site can opt in by adding a
 `sitebrew.yaml` at its root and changing only its own workflow call:
 
 ```yaml
@@ -46,11 +49,11 @@ The schema accepts either `builder.release` from the committed map or
 recorded in that map. Only the two boolean build options above are accepted.
 The validation job reads the matching revision of the map and validator; the
 build job runs `hugo-real` in that digest-pinned image on a Railway runner and
-has no OIDC permission. The nested `build.yml` publish job restores the build
-cache and uses the existing scoped OIDC upload, preview callback, and PR
-comment. Sites still calling `build.yml` use its previous runner build path.
+has no OIDC permission. The publish job restores the build cache and uses
+the same scoped OIDC upload, preview callback, and PR comment as the legacy
+workflow. Sites still calling `build.yml` use its unchanged runner build path.
 
-For rollback, re-run the publish workflow for the earlier source commit.
+For rollback, re-run an earlier successful publish run of this workflow.
 The build summary records that SHA and the resolved image digest. A re-run
 checks out the same source commit and resolves against the same reviewed
 site-actions revision. Release mappings are append-only: never rewrite a tag
@@ -64,15 +67,16 @@ and the approved options; the file cannot be deleted or moved. Only a human
 with workflow access can opt a site in.
 
 The site's selected-actions allowlist must include the pinned `sitebrew.yml`
-call, its nested `build.yml` call at the same reviewed commit, `actions/checkout`
-and `actions/cache`. The legacy path's `peaceiris/actions-hugo` remains needed
-for PR-close cleanup until that cleanup is moved to the image path.
+call, `actions/checkout`, `actions/cache`, and `actions/github-script`.
+PR-close cleanup builds its deletion list inside the recorded image, then
+deletes those keys in a separate OIDC-enabled job.
 
 **Release gate:** `@stable` is production for every existing site. This PR
 does not advance it. Before merging changes that trigger `promote.yml`, the
-owner must publish the image, make GHCR readable by site runners, commit the
-same digest to the platform release list and this map, and validate the new
-workflow on the canary. No production site workflow is edited here.
+owner must publish the platform's owner-gated `builder-image.json` release,
+make GHCR readable by site runners, copy its `releaseTag` and `digest` into
+this map, and validate the new workflow on the canary. This map is populated
+only from that platform release. No production site workflow is edited here.
 
 From a site repository's own `.github/workflows/build.yml`:
 
@@ -148,6 +152,9 @@ call, since a preview's R2 content is always exactly its own last build output
 and a list-then-delete flow would need a second, query-string SigV4 signing
 path for no gain over rebuilding the same commit. It then calls
 `DELETE <api-base-url>/v1/actions/deploy-callback` to remove the KV mapping.
+For the opt-in workflow, `cleanup-build` uses the same recorded image digest
+and build options as its publish build. The credentialed `cleanup` job only
+restores that output and deletes its keys.
 
 ## Opt-in npm-based build tooling (e.g. Tailwind CSS)
 
@@ -232,7 +239,8 @@ mechanism existed.
 ## Testing
 
 ```
-npm test   # node --test scripts/*.test.mjs — no install step, zero deps
+npm ci --ignore-scripts
+npm test   # node --test scripts/*.test.mjs
 ```
 
 `scripts/upload-to-r2.test.mjs` and `scripts/delete-from-r2.test.mjs` each
