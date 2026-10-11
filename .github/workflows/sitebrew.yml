@@ -1,0 +1,97 @@
+name: sitebrew-opt-in
+
+# Only callers that explicitly name this workflow use the pinned builder path.
+on:
+  workflow_call:
+
+jobs:
+  identify:
+    if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'pull_request' && github.event.action != 'closed')
+    runs-on: [self-hosted, linux, x64, railway]
+    permissions:
+      id-token: write
+    outputs:
+      ref: ${{ steps.self.outputs.ref }}
+    steps:
+      - name: Identify this reviewed workflow revision
+        id: self
+        run: |
+          set -euo pipefail
+          response=$(curl -fsS -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=sitebrew-config")
+          WORKFLOW_TOKEN="$(node -e 'process.stdout.write(JSON.parse(require("fs").readFileSync(0,"utf8")).value)' <<<"$response")"
+          ref=$(WORKFLOW_TOKEN="$WORKFLOW_TOKEN" node -e 'const p=JSON.parse(Buffer.from(process.env.WORKFLOW_TOKEN.split(".")[1],"base64url")); if (!p.job_workflow_ref?.startsWith("sitebrewhq/sitebrew-site-actions/.github/workflows/sitebrew.yml@") || !/^[0-9a-f]{40}$/.test(p.job_workflow_sha)) process.exit(1); process.stdout.write(p.job_workflow_sha)')
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+
+  resolve:
+    needs: identify
+    runs-on: [self-hosted, linux, x64, railway]
+    permissions:
+      contents: read
+    outputs:
+      image: ${{ steps.config.outputs.image }}
+      digest: ${{ steps.config.outputs.digest }}
+      npm: ${{ steps.config.outputs.npm }}
+      minify: ${{ steps.config.outputs.minify }}
+    steps:
+      - name: Checkout site
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Checkout reviewed validator and release mapping
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.2.2
+        with:
+          repository: sitebrewhq/sitebrew-site-actions
+          ref: ${{ needs.identify.outputs.ref }}
+          path: .site-actions
+          persist-credentials: false
+      - name: Install validator dependencies
+        run: npm ci --ignore-scripts --prefix .site-actions
+      - name: Validate and resolve sitebrew.yaml
+        id: config
+        run: node .site-actions/scripts/resolve-sitebrew-config.mjs sitebrew.yaml .site-actions/builder-images.json
+
+  build:
+    needs: resolve
+    runs-on: [self-hosted, linux, x64, railway]
+    container:
+      image: ${{ needs.resolve.outputs.image }}
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout site
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Build in the recorded image
+        env:
+          USE_NPM: ${{ needs.resolve.outputs.npm }}
+          MINIFY: ${{ needs.resolve.outputs.minify }}
+        run: |
+          set -euo pipefail
+          if [ "$USE_NPM" = true ]; then npm ci --ignore-scripts; fi
+          if [ "$MINIFY" = true ]; then
+            /usr/local/bin/hugo-real --gc --minify
+          else
+            /usr/local/bin/hugo-real --gc
+          fi
+      - name: Save build output for the OIDC publish job
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: public
+          key: site-build-${{ github.run_id }}
+      - name: Record rollback identity
+        env:
+          IMAGE: ${{ needs.resolve.outputs.image }}
+        run: |
+          echo "source_sha=$GITHUB_SHA image=$IMAGE" >> "$GITHUB_STEP_SUMMARY"
+
+  publish:
+    needs: build
+    if: always() && (needs.build.result == 'success' || (github.event_name == 'pull_request' && github.event.action == 'closed'))
+    permissions:
+      contents: read
+      id-token: write
+      pull-requests: write
+    uses: ./.github/workflows/build.yml
+    with:
+      prebuilt-cache-key: ${{ github.event.action != 'closed' && format('site-build-{0}', github.run_id) || '' }}

@@ -7,6 +7,73 @@ Actions-publish model.
 
 ## Usage
 
+### Opt-in digest-pinned builder (4-02)
+
+After the owner has published a 4-01 `builder-image.json` release, copied its
+`releaseTag` and `digest` into the committed `builder-images.json` map here,
+and exercised this path on the canary, a site can opt in by adding a
+`sitebrew.yaml` at its root and changing only its own workflow call:
+
+```yaml
+# sitebrew.yaml (the digest must occur in builder-images.json)
+schemaVersion: 1
+builder:
+  release: vX.Y.Z
+build:
+  npm: false
+  minify: true
+```
+
+```yaml
+# .github/workflows/build.yml in the site repository
+name: build-and-deploy
+on:
+  push:
+    branches: [main]
+  pull_request:
+    types: [opened, synchronize, reopened, closed]
+permissions:
+  contents: read
+  id-token: write
+  pull-requests: write
+jobs:
+  deploy:
+    uses: sitebrewhq/sitebrew-site-actions/.github/workflows/sitebrew.yml@<reviewed-commit-sha>
+```
+
+The schema accepts either `builder.release` from the committed map or
+`builder.image` as `ghcr.io/sitebrewhq/sitebrew-executor@sha256:<digest>`
+recorded in that map. Only the two boolean build options above are accepted.
+The validation job reads the matching revision of the map and validator; the
+build job runs `hugo-real` in that digest-pinned image on a Railway runner and
+has no OIDC permission. The nested `build.yml` publish job restores the build
+cache and uses the existing scoped OIDC upload, preview callback, and PR
+comment. Sites still calling `build.yml` use its previous runner build path.
+
+For rollback, re-run the publish workflow for the earlier source commit.
+The build summary records that SHA and the resolved image digest. A re-run
+checks out the same source commit and resolves against the same reviewed
+site-actions revision. Release mappings are append-only: never rewrite a tag
+to a different digest.
+
+The platform agent policy denies `.github/**` (including this workflow call),
+`.git/**`, `.claude/**`, `config/**`, Hugo config, `package.json`, lockfiles,
+`public/**`, and `.sitebrew/**` except notes for note jobs. For site changes
+it permits only a schema-valid `sitebrew.yaml` using a recorded builder digest
+and the approved options; the file cannot be deleted or moved. Only a human
+with workflow access can opt a site in.
+
+The site's selected-actions allowlist must include the pinned `sitebrew.yml`
+call, its nested `build.yml` call at the same reviewed commit, `actions/checkout`
+and `actions/cache`. The legacy path's `peaceiris/actions-hugo` remains needed
+for PR-close cleanup until that cleanup is moved to the image path.
+
+**Release gate:** `@stable` is production for every existing site. This PR
+does not advance it. Before merging changes that trigger `promote.yml`, the
+owner must publish the image, make GHCR readable by site runners, commit the
+same digest to the platform release list and this map, and validate the new
+workflow on the canary. No production site workflow is edited here.
+
 From a site repository's own `.github/workflows/build.yml`:
 
 ```yaml
