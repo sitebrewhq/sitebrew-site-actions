@@ -85,17 +85,6 @@ jobs:
           else
             /usr/local/bin/hugo-real --gc
           fi
-      - name: Emit serving marker
-        env:
-          IMAGE_DIGEST: ${{ needs.resolve.outputs.digest }}
-        run: |
-          node --input-type=module -e '
-            import { mkdirSync, writeFileSync } from "node:fs";
-            if (!/^[0-9a-f]{40}$/i.test(process.env.GITHUB_SHA ?? "")) throw new Error("invalid source SHA");
-            if (!/^sha256:[0-9a-f]{64}$/i.test(process.env.IMAGE_DIGEST ?? "")) throw new Error("invalid image digest");
-            mkdirSync("public/.sitebrew", { recursive: true });
-            writeFileSync("public/.sitebrew/build.json", JSON.stringify({ sourceCommit: process.env.GITHUB_SHA.toLowerCase(), imageDigest: process.env.IMAGE_DIGEST.toLowerCase() }) + "\n");
-          '
       - name: Save build output for publish
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -108,7 +97,7 @@ jobs:
           echo "source_sha=$GITHUB_SHA image=$IMAGE" >> "$GITHUB_STEP_SUMMARY"
 
   deploy:
-    needs: build
+    needs: [build, resolve]
     if: needs.build.result == 'success'
     runs-on: blacksmith-2vcpu-ubuntu-2404
     permissions:
@@ -287,7 +276,11 @@ jobs:
 
       - name: Upload site to R2
         id: upload
+        # This separate runner cannot inherit processes left by the site build.
+        # The reviewed uploader writes and verifies the marker before R2 upload.
         env:
+          EXPECTED_SOURCE_COMMIT: ${{ github.sha }}
+          EXPECTED_IMAGE_DIGEST: ${{ needs.resolve.outputs.digest }}
           R2_ACCOUNT_ID: ${{ steps.mint.outputs.accountId }}
           R2_BUCKET: ${{ steps.mint.outputs.bucket }}
           R2_PREFIX: ${{ steps.mint.outputs.prefix }}

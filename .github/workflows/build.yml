@@ -92,15 +92,6 @@ jobs:
         run: npm ci
       - name: Build
         run: hugo --gc --minify
-      - name: Emit serving marker
-        run: |
-          node --input-type=module -e '
-            import { mkdirSync, writeFileSync } from "node:fs";
-            if (!/^[0-9a-f]{40}$/i.test(process.env.GITHUB_SHA ?? "")) throw new Error("invalid source SHA");
-            mkdirSync("public/.sitebrew", { recursive: true });
-            writeFileSync("public/.sitebrew/build.json", JSON.stringify({ sourceCommit: process.env.GITHUB_SHA.toLowerCase(), imageDigest: null }) + "\n");
-          '
-
       # `actions/cache`, not `actions/upload-artifact`: the org-wide GitHub
       # Actions *artifact storage* quota (distinct from the compute-minute
       # quota Blacksmith above replaces) is a single pool the ~170 site
@@ -301,7 +292,10 @@ jobs:
 
       - name: Upload site to R2
         id: upload
+        # This separate runner cannot inherit processes left by the site build.
+        # The reviewed uploader writes and verifies the marker before R2 upload.
         env:
+          EXPECTED_SOURCE_COMMIT: ${{ github.sha }}
           R2_ACCOUNT_ID: ${{ steps.mint.outputs.accountId }}
           R2_BUCKET: ${{ steps.mint.outputs.bucket }}
           R2_PREFIX: ${{ steps.mint.outputs.prefix }}

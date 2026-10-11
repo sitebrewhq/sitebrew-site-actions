@@ -18,11 +18,37 @@
  */
 
 import { createHash, createHmac } from "node:crypto";
-import { readdir, readFile } from "node:fs/promises";
+import { lstat, mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { extname, join, relative } from "node:path";
 
 const REGION = "auto";
 const SERVICE = "s3";
+const BUILD_MARKER = ".sitebrew/build.json";
+
+export function expectedBuildMarker({ sourceCommit, imageDigest = null }) {
+  if (!/^[0-9a-f]{40}$/i.test(sourceCommit ?? "")) throw new Error("invalid source SHA");
+  if (imageDigest !== null && !/^sha256:[0-9a-f]{64}$/i.test(imageDigest)) {
+    throw new Error("invalid image digest");
+  }
+  return Buffer.from(JSON.stringify({
+    sourceCommit: sourceCommit.toLowerCase(),
+    imageDigest: imageDigest?.toLowerCase() ?? null,
+  }) + "\n");
+}
+
+/** Replace the marker after the untrusted build output is restored. */
+export async function writeBuildMarker(directory, marker) {
+  const markerDirectory = join(directory, ".sitebrew");
+  const existing = await lstat(markerDirectory).catch((error) => {
+    if (error.code === "ENOENT") return null;
+    throw error;
+  });
+  if (existing && !existing.isDirectory()) await rm(markerDirectory, { recursive: true, force: true });
+  await mkdir(markerDirectory, { recursive: true });
+  const markerPath = join(directory, BUILD_MARKER);
+  await rm(markerPath, { recursive: true, force: true });
+  await writeFile(markerPath, marker);
+}
 
 /** `sitebrew-worker`'s own `guessType` (`src/index.js`) — kept identical on purpose. */
 const CONTENT_TYPES = {
@@ -188,14 +214,24 @@ export async function uploadDirectoryToR2({
   accessKeyId,
   secretAccessKey,
   sessionToken,
+  expectedMarker,
   fetchImpl = fetch,
   log = console.log,
 }) {
   const endpoint = `https://${accountId}.r2.cloudflarestorage.com`;
   const files = await listFiles(directory);
 
+  if (expectedMarker) {
+    if (!files.includes(BUILD_MARKER) || !(await readFile(join(directory, BUILD_MARKER))).equals(expectedMarker)) {
+      throw new Error("build marker does not match workflow values");
+    }
+  }
+
   await runWithConcurrency(files, UPLOAD_CONCURRENCY, async (path) => {
     const body = await readFile(join(directory, path));
+    if (path === BUILD_MARKER && expectedMarker && !body.equals(expectedMarker)) {
+      throw new Error("build marker changed before upload");
+    }
     const key = `${prefix}${path}`;
     const url = `${endpoint}/${bucket}/${encodeUriPath(key)}`;
     const response = await putObject({
@@ -225,6 +261,8 @@ async function main() {
     R2_ACCESS_KEY_ID,
     R2_SECRET_ACCESS_KEY,
     R2_SESSION_TOKEN,
+    EXPECTED_SOURCE_COMMIT,
+    EXPECTED_IMAGE_DIGEST,
     SITE_DIR = "public",
   } = process.env;
 
@@ -239,6 +277,12 @@ async function main() {
     if (!value) throw new Error(`missing required env var ${name}`);
   }
 
+  const marker = expectedBuildMarker({
+    sourceCommit: EXPECTED_SOURCE_COMMIT,
+    imageDigest: EXPECTED_IMAGE_DIGEST === undefined ? null : EXPECTED_IMAGE_DIGEST,
+  });
+  await writeBuildMarker(SITE_DIR, marker);
+
   const result = await uploadDirectoryToR2({
     directory: SITE_DIR,
     accountId: R2_ACCOUNT_ID,
@@ -247,6 +291,7 @@ async function main() {
     accessKeyId: R2_ACCESS_KEY_ID,
     secretAccessKey: R2_SECRET_ACCESS_KEY,
     sessionToken: R2_SESSION_TOKEN,
+    expectedMarker: marker,
   });
   console.log(`done: ${result.uploaded} file(s) uploaded to ${R2_BUCKET}/${R2_PREFIX}`);
 }

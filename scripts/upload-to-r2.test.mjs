@@ -1,6 +1,89 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { contentTypeFor, listFiles, signPutRequest, uploadDirectoryToR2 } from "./upload-to-r2.mjs";
+import { contentTypeFor, expectedBuildMarker, listFiles, signPutRequest, uploadDirectoryToR2, writeBuildMarker } from "./upload-to-r2.mjs";
+
+test("deploy writes the workflow marker over site-controlled output", async () => {
+  const { mkdtemp, mkdir, readFile, rm, writeFile } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const dir = await mkdtemp(join(tmpdir(), "site-actions-marker-"));
+  const marker = expectedBuildMarker({ sourceCommit: "A".repeat(40), imageDigest: `sha256:${"B".repeat(64)}` });
+  try {
+    await mkdir(join(dir, ".sitebrew"));
+    await writeFile(join(dir, ".sitebrew", "build.json"), '{"sourceCommit":"attacker"}\n');
+    await writeFile(join(dir, ".sitebrew", "other.txt"), "keep");
+    await writeBuildMarker(dir, marker);
+    assert.equal((await readFile(join(dir, ".sitebrew", "build.json"))).toString(), marker.toString());
+    assert.equal((await readFile(join(dir, ".sitebrew", "other.txt"))).toString(), "keep");
+    assert.deepEqual(JSON.parse(marker), { sourceCommit: "a".repeat(40), imageDigest: `sha256:${"b".repeat(64)}` });
+    assert.deepEqual(JSON.parse(expectedBuildMarker({ sourceCommit: "a".repeat(40) })), {
+      sourceCommit: "a".repeat(40), imageDigest: null,
+    });
+    assert.throws(() => expectedBuildMarker({ sourceCommit: "attacker" }), /invalid source SHA/);
+    assert.throws(() => expectedBuildMarker({ sourceCommit: "a".repeat(40), imageDigest: "" }), /invalid image digest/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("upload rejects a changed marker before any R2 request", async () => {
+  const { mkdtemp, mkdir, rm, writeFile } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const dir = await mkdtemp(join(tmpdir(), "site-actions-marker-"));
+  const marker = expectedBuildMarker({ sourceCommit: "a".repeat(40) });
+  try {
+    await mkdir(join(dir, ".sitebrew"));
+    await writeFile(join(dir, ".sitebrew", "build.json"), "tampered\n");
+    await writeFile(join(dir, "index.html"), "hi");
+    let requests = 0;
+    await assert.rejects(uploadDirectoryToR2({
+      directory: dir,
+      accountId: "acct123",
+      bucket: "sitebrew-sites",
+      prefix: "sites/x/",
+      accessKeyId: "AKID",
+      secretAccessKey: "SECRET",
+      expectedMarker: marker,
+      fetchImpl: async () => { requests++; return { ok: true }; },
+      log: () => {},
+    }), /build marker does not match workflow values/);
+    assert.equal(requests, 0);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("upload sends exactly the workflow marker bytes", async () => {
+  const { mkdtemp, rm } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const dir = await mkdtemp(join(tmpdir(), "site-actions-marker-"));
+  const marker = expectedBuildMarker({ sourceCommit: "a".repeat(40) });
+  try {
+    await writeBuildMarker(dir, marker);
+    const uploaded = [];
+    await uploadDirectoryToR2({
+      directory: dir,
+      accountId: "acct123",
+      bucket: "sitebrew-sites",
+      prefix: "sites/x/",
+      accessKeyId: "AKID",
+      secretAccessKey: "SECRET",
+      expectedMarker: marker,
+      fetchImpl: async (url, options) => {
+        uploaded.push({ url, body: options.body });
+        return { ok: true };
+      },
+      log: () => {},
+    });
+    assert.equal(uploaded.length, 1);
+    assert.ok(uploaded[0].url.endsWith("/.sitebrew/build.json"));
+    assert.deepEqual(uploaded[0].body, marker);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
 
 test("contentTypeFor matches sitebrew-worker's guessType for common extensions", () => {
   assert.equal(contentTypeFor("index.html"), "text/html; charset=utf-8");
