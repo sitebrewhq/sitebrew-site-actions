@@ -122,6 +122,7 @@ async function deleteObject({ url, accessKeyId, secretAccessKey, sessionToken, f
  */
 export async function deleteDirectoryFromR2({
   directory,
+  files: explicitFiles,
   accountId,
   bucket,
   prefix,
@@ -132,7 +133,11 @@ export async function deleteDirectoryFromR2({
   log = console.log,
 }) {
   const endpoint = `https://${accountId}.r2.cloudflarestorage.com`;
-  const files = await listFiles(directory);
+  // `files` (relative paths, as `listFiles` would return them) lets the
+  // caller hand over a list computed in another job — `build.yml`'s
+  // `cleanup` job receives `cleanup-build`'s file list as a job output and
+  // never has the built `public/` on disk itself.
+  const files = explicitFiles ?? (await listFiles(directory));
 
   for (const path of files) {
     const key = `${prefix}${path}`;
@@ -148,6 +153,15 @@ export async function deleteDirectoryFromR2({
   return { deleted: files.length };
 }
 
+/** Newline-separated relative paths → sorted, de-duplicated list; blank lines and a leading `./` are dropped. */
+export function parseFileList(text) {
+  const files = text
+    .split("\n")
+    .map((line) => line.replace(/^\.\//, "").trim())
+    .filter((line) => line.length > 0);
+  return [...new Set(files)].sort();
+}
+
 async function main() {
   const {
     R2_ACCOUNT_ID,
@@ -157,6 +171,7 @@ async function main() {
     R2_SECRET_ACCESS_KEY,
     R2_SESSION_TOKEN,
     SITE_DIR = "public",
+    FILE_LIST,
   } = process.env;
 
   for (const [name, value] of Object.entries({
@@ -170,8 +185,13 @@ async function main() {
     if (!value) throw new Error(`missing required env var ${name}`);
   }
 
+  // `FILE_LIST` = path to a newline-separated list of relative paths (one per
+  // line, as `find . -type f` under `public/` prints them). When set, exactly
+  // that list is deleted and `SITE_DIR` is never read.
+  const files = FILE_LIST ? parseFileList(await readFile(FILE_LIST, "utf8")) : undefined;
   const result = await deleteDirectoryFromR2({
     directory: SITE_DIR,
+    files,
     accountId: R2_ACCOUNT_ID,
     bucket: R2_BUCKET,
     prefix: R2_PREFIX,
