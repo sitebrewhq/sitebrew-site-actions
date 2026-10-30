@@ -1,6 +1,46 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { listFiles, signDeleteRequest, deleteDirectoryFromR2 } from "./delete-from-r2.mjs";
+import { listFiles, signDeleteRequest, deleteDirectoryFromR2, parseFileList } from "./delete-from-r2.mjs";
+
+test("parseFileList drops blank lines and leading ./, de-duplicates and sorts", () => {
+  assert.deepEqual(parseFileList("./index.html\n\ncss/style.css\n./css/style.css\n  \nabout/index.html\n"), [
+    "about/index.html",
+    "css/style.css",
+    "index.html",
+  ]);
+  assert.deepEqual(parseFileList(""), []);
+});
+
+test("deleteDirectoryFromR2 deletes an explicit file list without touching the directory", async () => {
+  const requests = [];
+  const fetchImpl = async (url, init) => {
+    requests.push({ url, method: init.method });
+    return new Response(null, { status: 204 });
+  };
+
+  const result = await deleteDirectoryFromR2({
+    directory: "/nonexistent/public",
+    files: ["index.html", "css/style.css"],
+    accountId: "acct123",
+    bucket: "sitebrew-sites",
+    prefix: "sites/pr-7--site_abc/",
+    accessKeyId: "AKID",
+    secretAccessKey: "SECRET",
+    sessionToken: "TOKEN",
+    fetchImpl,
+    log: () => {},
+  });
+
+  assert.equal(result.deleted, 2);
+  assert.deepEqual(
+    requests.map((r) => r.url).sort(),
+    [
+      "https://acct123.r2.cloudflarestorage.com/sitebrew-sites/sites/pr-7--site_abc/css/style.css",
+      "https://acct123.r2.cloudflarestorage.com/sitebrew-sites/sites/pr-7--site_abc/index.html",
+    ],
+  );
+  assert.ok(requests.every((r) => r.method === "DELETE"));
+});
 
 test("listFiles walks nested directories and sorts the result", async () => {
   const { mkdtemp, mkdir, writeFile, rm } = await import("node:fs/promises");

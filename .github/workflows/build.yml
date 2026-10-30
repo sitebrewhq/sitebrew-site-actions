@@ -406,6 +406,8 @@ jobs:
     runs-on: blacksmith-2vcpu-ubuntu-2404
     permissions:
       contents: read
+    outputs:
+      files: ${{ steps.files.outputs.files }}
     steps:
       - name: Checkout PR head
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.2.2
@@ -421,11 +423,33 @@ jobs:
         run: npm ci
       - name: Build
         run: hugo --gc --minify
-      - name: Save build output to cache
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: public
-          key: cleanup-build-${{ github.run_id }}
+      # Handed to `cleanup` as a job output, not through `actions/cache` the
+      # way `build` → `deploy` is: on a `pull_request: closed` event the
+      # runner's cache is read-only (`Cache mode: read` in the job log — the
+      # closed PR's merge ref no longer accepts cache writes), so
+      # `actions/cache/save` logged "Unable to reserve cache" on every closed
+      # PR, left the job green, and `cleanup` then died on
+      # `fail-on-cache-miss` before it ever reached R2 — previews of merged
+      # PRs were never deleted (sitebrew-site-actions#20, found live
+      # 2026-10-30 on three consecutive merges). What crosses the job
+      # boundary is only the list of relative paths under this PR's own
+      # preview prefix (gzip + base64, one line — far below the 1 MB
+      # per-output limit for any Hugo site); a hostile build can at most name
+      # keys inside its own prefix, exactly what the rebuilt `public/` could
+      # already do, so the security split above is unchanged.
+      - name: Emit build file list
+        id: files
+        run: |
+          set -euo pipefail
+          list="${RUNNER_TEMP}/cleanup-files.txt"
+          (cd public && find . -type f | sed 's#^\./##' | LC_ALL=C sort) > "${list}"
+          encoded=$(gzip -9c "${list}" | base64 -w0)
+          if [ "${#encoded}" -gt 900000 ]; then
+            echo "::error::Build file list is ${#encoded} bytes encoded — over the job-output limit, cannot hand it to cleanup"
+            exit 1
+          fi
+          echo "$(wc -l < "${list}") file(s) under public/ (${#encoded} bytes encoded)"
+          echo "files=${encoded}" >> "$GITHUB_OUTPUT"
 
   cleanup:
     needs: cleanup-build
@@ -487,16 +511,22 @@ jobs:
           echo "api-base-url=${api_base_url}" >> "$GITHUB_OUTPUT"
           echo "oidc-audience=${oidc_audience}" >> "$GITHUB_OUTPUT"
 
-      # Restored from `cleanup-build`'s cache rather than rebuilt here — this
+      # Taken from `cleanup-build`'s job output rather than rebuilt here — this
       # job holds `id-token: write`, so it must never run the site repo's own
       # code (Hugo templates, and especially an opt-in `npm ci`) itself. See
-      # `cleanup-build`'s own comment above for why that split exists.
-      - name: Restore build output from cache
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: public
-          key: cleanup-build-${{ github.run_id }}
-          fail-on-cache-miss: true
+      # `cleanup-build`'s own comment above for why that split exists and why
+      # the handoff is a job output instead of `actions/cache`.
+      - name: Materialise build file list
+        env:
+          FILES_B64: ${{ needs.cleanup-build.outputs.files }}
+        run: |
+          set -euo pipefail
+          if [ -z "${FILES_B64}" ]; then
+            echo "::error::cleanup-build handed over no file list — refusing to guess which preview keys to delete"
+            exit 1
+          fi
+          printf '%s' "${FILES_B64}" | base64 -d | gunzip > "${RUNNER_TEMP}/cleanup-files.txt"
+          echo "$(wc -l < "${RUNNER_TEMP}/cleanup-files.txt") file(s) to delete"
 
       - name: Request GitHub OIDC token
         id: oidc
@@ -565,7 +595,7 @@ jobs:
           R2_ACCESS_KEY_ID: ${{ steps.mint.outputs.accessKeyId }}
           R2_SECRET_ACCESS_KEY: ${{ steps.mint.outputs.secretAccessKey }}
           R2_SESSION_TOKEN: ${{ steps.mint.outputs.sessionToken }}
-          SITE_DIR: public
+          FILE_LIST: ${{ runner.temp }}/cleanup-files.txt
         run: node .site-actions/scripts/delete-from-r2.mjs
 
       - name: Remove preview hostname

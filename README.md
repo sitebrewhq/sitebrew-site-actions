@@ -74,9 +74,12 @@ the same way as a push, but to the sibling R2 prefix above, and additionally:
   the PR (updates its own prior comment on a later push, matching
   `sitebrew-site-pipeline`'s existing convention).
 
-On `pull_request: closed`, a separate `cleanup` job rebuilds that PR's last
-commit (`github.event.pull_request.head.sha`) and deletes the resulting file
-list from R2 (`scripts/delete-from-r2.mjs`) — deliberately not a `ListObjectsV2`
+On `pull_request: closed`, a credential-free `cleanup-build` job rebuilds that
+PR's last commit (`github.event.pull_request.head.sha`) and hands the resulting
+file list to `cleanup` as a job output (gzip + base64 — not `actions/cache`,
+which is read-only on a closed PR's merge ref; see the workflow comment and
+sitebrew-site-actions#20), which deletes exactly those keys from R2
+(`scripts/delete-from-r2.mjs`, `FILE_LIST`) — deliberately not a `ListObjectsV2`
 call, since a preview's R2 content is always exactly its own last build output
 and a list-then-delete flow would need a second, query-string SigV4 signing
 path for no gain over rebuilding the same commit. It then calls
@@ -93,7 +96,8 @@ migrating a page from an original Tailwind-based site and wanting to reuse
 its utility classes close to verbatim instead of hand-translating them into
 bespoke CSS. Both of these are credential-free jobs by design (`contents:
 read` only) — the `deploy`/`cleanup` jobs that hold `id-token: write` only
-ever restore the already-built `public/` from cache, never run the site
+ever consume the already-built output (`deploy` restores `public/` from cache,
+`cleanup` receives the file list as a job output), never run the site
 repo's own code, so nothing a site's own `npm ci` run does can reach a live
 R2 credential. To opt in, a site repo adds:
 
