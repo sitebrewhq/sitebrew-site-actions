@@ -11,6 +11,10 @@ name: sitebrew-site-actions
 # 2026-09-01: reuse this run's own OIDC identity rather than shipping a
 # stored `CF_API_TOKEN` into a customer-triggered workflow a second time).
 #
+# API calls retry 409 from preview sweep claims (sitebrew-platform #548),
+# plus 429/503, honouring Retry-After with a 16-minute total budget to cover
+# the sweep's 15-minute crash recovery window and one minute of margin.
+#
 # `api-base-url`/`oidc-audience` default to staging, and every site repo's
 # own `build.yml` (from `sitebrew-site-bootstrap`) calls this workflow with no
 # `with:` override at all — found live 2026-09-08 (thread 1788779979.326759,
@@ -236,27 +240,6 @@ jobs:
           echo "::add-mask::${token}"
           echo "token=${token}" >> "$GITHUB_OUTPUT"
 
-      - name: Mint R2 upload credential
-        id: mint
-        env:
-          API_BASE_URL: ${{ steps.resolve-stage.outputs.api-base-url }}
-          OIDC_TOKEN: ${{ steps.oidc.outputs.token }}
-        run: |
-          set -euo pipefail
-          resp=$(curl -sSf -X POST "${API_BASE_URL}/v1/actions/upload-token" \
-            -H "Authorization: Bearer ${OIDC_TOKEN}")
-          node -e '
-            const c = JSON.parse(require("fs").readFileSync(0, "utf8"));
-            for (const k of ["accessKeyId", "secretAccessKey", "sessionToken"]) {
-              console.log(`::add-mask::${c[k]}`);
-            }
-            const out = process.env.GITHUB_OUTPUT;
-            const fs = require("fs");
-            for (const k of ["accessKeyId", "secretAccessKey", "sessionToken", "accountId", "bucket", "prefix"]) {
-              fs.appendFileSync(out, `${k}=${c[k]}\n`);
-            }
-          ' <<<"$resp"
-
       - name: Resolve this reusable workflow's own repository and ref
         # Neither `github.workflow_ref` (names the CALLER's own workflow
         # file even inside a called job — verified live 2026-09-01: checked
@@ -290,6 +273,27 @@ jobs:
           ref: ${{ steps.self.outputs.ref }}
           path: .site-actions
           sparse-checkout: scripts
+
+      - name: Mint R2 upload credential
+        id: mint
+        env:
+          API_BASE_URL: ${{ steps.resolve-stage.outputs.api-base-url }}
+          OIDC_TOKEN: ${{ steps.oidc.outputs.token }}
+        run: |
+          set -euo pipefail
+          resp=$(node .site-actions/scripts/sitebrew-api-call.mjs POST "${API_BASE_URL}/v1/actions/upload-token" \
+            -H "Authorization: Bearer ${OIDC_TOKEN}")
+          node -e '
+            const c = JSON.parse(require("fs").readFileSync(0, "utf8"));
+            for (const k of ["accessKeyId", "secretAccessKey", "sessionToken"]) {
+              console.log(`::add-mask::${c[k]}`);
+            }
+            const out = process.env.GITHUB_OUTPUT;
+            const fs = require("fs");
+            for (const k of ["accessKeyId", "secretAccessKey", "sessionToken", "accountId", "bucket", "prefix"]) {
+              fs.appendFileSync(out, `${k}=${c[k]}\n`);
+            }
+          ' <<<"$resp"
 
       - name: Upload site to R2
         id: upload
@@ -361,7 +365,7 @@ jobs:
           OIDC_TOKEN: ${{ steps.oidc.outputs.token }}
         run: |
           set -euo pipefail
-          resp=$(curl -sSf -X POST "${API_BASE_URL}/v1/actions/deploy-callback" \
+          resp=$(node .site-actions/scripts/sitebrew-api-call.mjs POST "${API_BASE_URL}/v1/actions/deploy-callback" \
             -H "Authorization: Bearer ${OIDC_TOKEN}")
           node -e '
             const c = JSON.parse(require("fs").readFileSync(0, "utf8"));
@@ -540,27 +544,6 @@ jobs:
           echo "::add-mask::${token}"
           echo "token=${token}" >> "$GITHUB_OUTPUT"
 
-      - name: Mint R2 delete credential
-        id: mint
-        env:
-          API_BASE_URL: ${{ steps.resolve-stage.outputs.api-base-url }}
-          OIDC_TOKEN: ${{ steps.oidc.outputs.token }}
-        run: |
-          set -euo pipefail
-          resp=$(curl -sSf -X POST "${API_BASE_URL}/v1/actions/upload-token" \
-            -H "Authorization: Bearer ${OIDC_TOKEN}")
-          node -e '
-            const c = JSON.parse(require("fs").readFileSync(0, "utf8"));
-            for (const k of ["accessKeyId", "secretAccessKey", "sessionToken"]) {
-              console.log(`::add-mask::${c[k]}`);
-            }
-            const out = process.env.GITHUB_OUTPUT;
-            const fs = require("fs");
-            for (const k of ["accessKeyId", "secretAccessKey", "sessionToken", "accountId", "bucket", "prefix"]) {
-              fs.appendFileSync(out, `${k}=${c[k]}\n`);
-            }
-          ' <<<"$resp"
-
       - name: Resolve this reusable workflow's own repository and ref
         # See the `deploy` job's own copy of this step for why this decodes
         # the OIDC token's `job_workflow_ref` claim instead of using a
@@ -587,6 +570,27 @@ jobs:
           path: .site-actions
           sparse-checkout: scripts
 
+      - name: Mint R2 delete credential
+        id: mint
+        env:
+          API_BASE_URL: ${{ steps.resolve-stage.outputs.api-base-url }}
+          OIDC_TOKEN: ${{ steps.oidc.outputs.token }}
+        run: |
+          set -euo pipefail
+          resp=$(node .site-actions/scripts/sitebrew-api-call.mjs POST "${API_BASE_URL}/v1/actions/upload-token" \
+            -H "Authorization: Bearer ${OIDC_TOKEN}")
+          node -e '
+            const c = JSON.parse(require("fs").readFileSync(0, "utf8"));
+            for (const k of ["accessKeyId", "secretAccessKey", "sessionToken"]) {
+              console.log(`::add-mask::${c[k]}`);
+            }
+            const out = process.env.GITHUB_OUTPUT;
+            const fs = require("fs");
+            for (const k of ["accessKeyId", "secretAccessKey", "sessionToken", "accountId", "bucket", "prefix"]) {
+              fs.appendFileSync(out, `${k}=${c[k]}\n`);
+            }
+          ' <<<"$resp"
+
       - name: Delete preview from R2
         env:
           R2_ACCOUNT_ID: ${{ steps.mint.outputs.accountId }}
@@ -604,5 +608,5 @@ jobs:
           OIDC_TOKEN: ${{ steps.oidc.outputs.token }}
         run: |
           set -euo pipefail
-          curl -sSf -X DELETE "${API_BASE_URL}/v1/actions/deploy-callback" \
+          node .site-actions/scripts/sitebrew-api-call.mjs DELETE "${API_BASE_URL}/v1/actions/deploy-callback" \
             -H "Authorization: Bearer ${OIDC_TOKEN}" >/dev/null
