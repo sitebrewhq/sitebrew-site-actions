@@ -41,6 +41,47 @@ for (const workflowName of ["build", "sitebrew"]) {
     const producer = job("cleanup-build");
     const consumer = job("cleanup");
 
+    test("cleanup uses the caller's explicit marker opt-in", () => {
+      assert.match(step(producer, "Emit build file list"), /^          BUILD_MARKER_ENABLED: \$\{\{ inputs\.build-marker \}\}$/m);
+    });
+
+    for (const enabled of [undefined, "false", "true"]) {
+      for (const existing of [false, true]) {
+        test(`marker=${enabled ?? "default"}, existing=${existing}: final cleanup list and SHA-256 survive artifact handoff`, () => {
+          const dir = mkdtempSync(join(tmpdir(), "cleanup-list-marker-"));
+          try {
+            const buildTemp = join(dir, "build-temp");
+            const cleanupTemp = join(dir, "cleanup-temp");
+            mkdirSync(join(dir, "public"));
+            mkdirSync(buildTemp);
+            mkdirSync(join(cleanupTemp, "cleanup-file-list"), { recursive: true });
+            writeFileSync(join(dir, "public", "index.html"), "hi");
+            if (existing) {
+              mkdirSync(join(dir, "public", ".sitebrew"));
+              writeFileSync(join(dir, "public", ".sitebrew", "build.json"), "site-owned");
+            }
+            const expected = (enabled === "true" || existing ? ".sitebrew/build.json\n" : "") + "index.html\n";
+            const output = join(dir, "output");
+            const emitted = run(script(step(producer, "Emit build file list")), dir, buildTemp, output,
+              { BUILD_MARKER_ENABLED: enabled });
+            assert.equal(emitted.status, 0, emitted.stdout + emitted.stderr);
+            const source = join(buildTemp, "cleanup-files.txt");
+            assert.equal(readFileSync(source, "utf8"), expected, "include the deploy-generated key exactly once when enabled");
+            const hash = createHash("sha256").update(expected).digest("hex");
+            assert.equal(readFileSync(output, "utf8"), `sha256=${hash}\n`, "hash the final uploaded list");
+            const destination = join(cleanupTemp, "cleanup-file-list", "cleanup-files.txt");
+            copyFileSync(source, destination);
+            const received = run(script(step(consumer, "Materialise build file list")), dir, cleanupTemp, output,
+              { EXPECTED_SHA256: hash });
+            assert.equal(received.status, 0, received.stdout + received.stderr);
+            assert.equal(readFileSync(destination, "utf8"), expected);
+          } finally {
+            rmSync(dir, { recursive: true, force: true });
+          }
+        });
+      }
+    }
+
     test("cleanup file list never travels in job outputs, an environment variable, or an inline expression", () => {
       assert.equal(producer.match(/^    outputs:\n((?:      .+\n)+)/m)?.[1],
         "      file-list-sha256: ${{ steps.file-list.outputs.sha256 }}\n");

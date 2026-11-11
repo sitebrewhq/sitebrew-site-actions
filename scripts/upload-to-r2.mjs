@@ -261,6 +261,7 @@ async function main() {
     R2_ACCESS_KEY_ID,
     R2_SECRET_ACCESS_KEY,
     R2_SESSION_TOKEN,
+    BUILD_MARKER_ENABLED,
     EXPECTED_SOURCE_COMMIT,
     EXPECTED_IMAGE_DIGEST,
     SITE_DIR = "public",
@@ -277,11 +278,14 @@ async function main() {
     if (!value) throw new Error(`missing required env var ${name}`);
   }
 
-  const marker = expectedBuildMarker({
-    sourceCommit: EXPECTED_SOURCE_COMMIT,
-    imageDigest: EXPECTED_IMAGE_DIGEST === undefined ? null : EXPECTED_IMAGE_DIGEST,
-  });
-  await writeBuildMarker(SITE_DIR, marker);
+  let marker;
+  if (BUILD_MARKER_ENABLED === "true") {
+    marker = expectedBuildMarker({
+      sourceCommit: EXPECTED_SOURCE_COMMIT,
+      imageDigest: EXPECTED_IMAGE_DIGEST === undefined ? null : EXPECTED_IMAGE_DIGEST,
+    });
+    await writeBuildMarker(SITE_DIR, marker);
+  }
 
   const result = await uploadDirectoryToR2({
     directory: SITE_DIR,

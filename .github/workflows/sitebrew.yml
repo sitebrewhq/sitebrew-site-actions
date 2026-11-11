@@ -4,6 +4,10 @@ name: sitebrew-opt-in
 on:
   workflow_call:
     inputs:
+      build-marker:
+        description: "Emit and verify .sitebrew/build.json for public serving verification"
+        type: boolean
+        default: false
       api-base-url:
         description: "Base URL of the sitebrew-api stage this run publishes to"
         type: string
@@ -278,8 +282,9 @@ jobs:
       - name: Upload site to R2
         id: upload
         # This separate runner cannot inherit processes left by the site build.
-        # The reviewed uploader writes and verifies the marker before R2 upload.
+        # When opted in, the reviewed uploader writes and verifies the marker.
         env:
+          BUILD_MARKER_ENABLED: ${{ inputs.build-marker }}
           EXPECTED_SOURCE_COMMIT: ${{ github.sha }}
           EXPECTED_IMAGE_DIGEST: ${{ needs.resolve.outputs.digest }}
           R2_ACCOUNT_ID: ${{ steps.mint.outputs.accountId }}
@@ -418,10 +423,18 @@ jobs:
       - name: Emit build file list
         id: file-list
         shell: bash
+        env:
+          BUILD_MARKER_ENABLED: ${{ inputs.build-marker }}
         run: |
           set -euo pipefail
           list="${RUNNER_TEMP}/cleanup-files.txt"
-          (cd public && find . -type f | sed 's#^\./##' | LC_ALL=C sort) > "${list}"
+          {
+            (cd public && find . -type f | sed 's#^\./##')
+            # Deploy adds this key after the build; include it before hashing.
+            if [ "${BUILD_MARKER_ENABLED:-false}" = true ]; then
+              echo '.sitebrew/build.json'
+            fi
+          } | LC_ALL=C sort -u > "${list}"
           digest=$(sha256sum "${list}")
           echo "sha256=${digest%% *}" >> "$GITHUB_OUTPUT"
           echo "$(wc -l < "${list}") file(s) under public/"

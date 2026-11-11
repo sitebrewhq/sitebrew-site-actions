@@ -259,8 +259,10 @@ than only failing silently against a live R2 endpoint.
 
 ### Serving proof marker
 
-Both reusable publish workflows place `public/.sitebrew/build.json` in the uploaded
-site. It contains `sourceCommit` (the checked-out push SHA) and
+Both reusable publish workflows accept `build-marker: true` to place
+`public/.sitebrew/build.json` in the uploaded site. The input defaults to `false`,
+preserving existing site output, including any site-owned file at that path.
+When enabled, the marker contains `sourceCommit` (the checked-out push SHA) and
 `imageDigest` (the validated pinned digest for `sitebrew.yml`, or `null` for
 legacy `build.yml`). The platform reads that path through the site's public
 hostname after observing Actions success; the marker must match before the
@@ -269,3 +271,5 @@ therefore uploads that commit's marker again. The deploy job generates the marke
 from workflow values after restoring the build output, then verifies its bytes
 before and during upload. Site build processes run in a separate job and cannot
 rewrite the marker on the deploy runner.
+PR-close cleanup includes the marker key when enabled, before hashing and
+uploading the final deletion list for SHA-256 verification.
