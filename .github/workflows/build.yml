@@ -410,6 +410,8 @@ jobs:
     runs-on: blacksmith-2vcpu-ubuntu-2404
     permissions:
       contents: read
+    outputs:
+      file-list-sha256: ${{ steps.file-list.outputs.sha256 }}
     steps:
       - name: Checkout PR head
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.2.2
@@ -443,10 +445,13 @@ jobs:
       # exactly what the rebuilt `public/` could already do, so the security
       # split above is unchanged.
       - name: Emit build file list
+        id: file-list
         run: |
           set -euo pipefail
           list="${RUNNER_TEMP}/cleanup-files.txt"
           (cd public && find . -type f | sed 's#^\./##' | LC_ALL=C sort) > "${list}"
+          digest=$(sha256sum "${list}")
+          echo "sha256=${digest%% *}" >> "$GITHUB_OUTPUT"
           echo "$(wc -l < "${list}") file(s) under public/"
       - name: Upload build file list
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -531,11 +536,27 @@ jobs:
           name: cleanup-files-${{ github.run_id }}
           path: ${{ runner.temp }}/cleanup-file-list
       - name: Materialise build file list
+        env:
+          EXPECTED_SHA256: ${{ needs.cleanup-build.outputs.file-list-sha256 }}
         run: |
           set -euo pipefail
           list="${RUNNER_TEMP}/cleanup-file-list/cleanup-files.txt"
           if [ ! -f "${list}" ]; then
             echo "::error::Build file list is missing from cleanup-build's artifact — refusing to guess which preview keys to delete"
+            exit 1
+          fi
+          # download-artifact only warns on digest mismatch; require our own
+          # file checksum before requesting OIDC or minting any credential.
+          if [[ ! "${EXPECTED_SHA256:-}" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::Build file list SHA-256 is missing or invalid — refusing to delete preview keys"
+            exit 1
+          fi
+          if ! digest=$(sha256sum "${list}"); then
+            echo "::error::Build file list SHA-256 could not be computed — refusing to delete preview keys"
+            exit 1
+          fi
+          if [ "${digest%% *}" != "${EXPECTED_SHA256}" ]; then
+            echo "::error::Build file list SHA-256 mismatch — refusing to delete preview keys"
             exit 1
           fi
           echo "$(wc -l < "${list}") file(s) to delete"
