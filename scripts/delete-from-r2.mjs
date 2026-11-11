@@ -135,7 +135,7 @@ export async function deleteDirectoryFromR2({
   const endpoint = `https://${accountId}.r2.cloudflarestorage.com`;
   // `files` (relative paths, as `listFiles` would return them) lets the
   // caller hand over a list computed in another job — `build.yml`'s
-  // `cleanup` job receives `cleanup-build`'s file list as a job output and
+  // `cleanup` job receives `cleanup-build`'s file list as an artifact and
   // never has the built `public/` on disk itself.
   const files = explicitFiles ?? (await listFiles(directory));
 

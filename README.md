@@ -39,7 +39,8 @@ with no useful log, not a permission-denied error on the specific step).
 
 The caller's own repository must have its **selected actions** allowlist
 include this workflow *and* every action it calls internally (`actions/checkout`,
-`peaceiris/actions-hugo`, `actions/cache`, `actions/github-script` — verified
+`peaceiris/actions-hugo`, `actions/cache`, `actions/github-script`,
+`actions/upload-artifact`, `actions/download-artifact` — verified
 live 2026-09-01 that GitHub's allowlist
 gates actions used inside a called reusable workflow too, not just the
 workflow file itself).
@@ -76,9 +77,12 @@ the same way as a push, but to the sibling R2 prefix above, and additionally:
 
 On `pull_request: closed`, a credential-free `cleanup-build` job rebuilds that
 PR's last commit (`github.event.pull_request.head.sha`) and hands the resulting
-file list to `cleanup` as a job output (gzip + base64 — not `actions/cache`,
-which is read-only on a closed PR's merge ref; see the workflow comment and
-sitebrew-site-actions#20), which deletes exactly those keys from R2
+file list to `cleanup` as an artifact retained for one day. Only paths are
+uploaded, keeping artifact storage small and avoiding job-output and environment
+string size limits. `actions/cache` is read-only on a closed PR's merge ref
+(see the workflow comment and sitebrew-site-actions#20). A failed artifact
+transfer or a missing list fails the job visibly; an empty list is valid.
+The credentialed `cleanup` job deletes exactly those keys from R2
 (`scripts/delete-from-r2.mjs`, `FILE_LIST`) — deliberately not a `ListObjectsV2`
 call, since a preview's R2 content is always exactly its own last build output
 and a list-then-delete flow would need a second, query-string SigV4 signing
