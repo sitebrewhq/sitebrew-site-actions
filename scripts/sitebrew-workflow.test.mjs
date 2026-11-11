@@ -18,7 +18,7 @@ for (const [job, name] of [
   });
 }
 
-test("closed-PR cleanup emits main's compressed file-list job output without a cache write", () => {
+test("closed-PR cleanup emits main's SHA-256 job output without a cache write", () => {
   const build = jobs["cleanup-build"];
   assert.deepEqual(build.outputs, legacy["cleanup-build"].outputs);
   assert.ok(!build.steps.some((entry) => entry.uses?.startsWith("actions/cache/")));
@@ -26,6 +26,25 @@ test("closed-PR cleanup emits main's compressed file-list job output without a c
   assert.deepEqual(step(build, "Emit build file list"), {
     ...step(legacy["cleanup-build"], "Emit build file list"), shell: "bash",
   });
+});
+
+for (const [job, name] of [
+  ["cleanup-build", "Upload build file list"],
+  ["cleanup", "Download build file list"],
+]) {
+  test(`${job}: ${name} exactly matches main's artifact action and settings`, () => {
+    assert.ok(step(jobs[job], name));
+    assert.deepEqual(step(jobs[job], name), step(legacy[job], name));
+  });
+}
+
+test("every opt-in action and pin is already used by main's build workflow", () => {
+  const allowed = new Set(Object.values(legacy).flatMap((job) => job.steps.map((entry) => entry.uses).filter(Boolean)));
+  for (const job of Object.values(jobs)) {
+    for (const entry of job.steps) {
+      if (entry.uses) assert.ok(allowed.has(entry.uses), `unexpected action or pin: ${entry.uses}`);
+    }
+  }
 });
 
 test("cleanup materialises main's file-list handoff without a cache restore", () => {

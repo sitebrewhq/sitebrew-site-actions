@@ -374,7 +374,7 @@ jobs:
     permissions:
       contents: read
     outputs:
-      files: ${{ steps.files.outputs.files }}
+      file-list-sha256: ${{ steps.file-list.outputs.sha256 }}
     steps:
       - name: Checkout closed PR head
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.2.2
@@ -394,7 +394,7 @@ jobs:
           else
             /usr/local/bin/hugo-real --gc
           fi
-      # Handed to `cleanup` as a job output, not through `actions/cache` the
+      # Handed to `cleanup` as an artifact, not through `actions/cache` the
       # way `build` → `deploy` is: on a `pull_request: closed` event the
       # runner's cache is read-only (`Cache mode: read` in the job log — the
       # closed PR's merge ref no longer accepts cache writes), so
@@ -402,26 +402,36 @@ jobs:
       # PR, left the job green, and `cleanup` then died on
       # `fail-on-cache-miss` before it ever reached R2 — previews of merged
       # PRs were never deleted (sitebrew-site-actions#20, found live
-      # 2026-10-30 on three consecutive merges). What crosses the job
-      # boundary is only the list of relative paths under this PR's own
-      # preview prefix (gzip + base64, one line — far below the 1 MB
-      # per-output limit for any Hugo site); a hostile build can at most name
-      # keys inside its own prefix, exactly what the rebuilt `public/` could
-      # already do, so the security split above is unchanged.
+      # 2026-10-30 on three consecutive merges). Job outputs are also too
+      # small: 1 MB total measured in UTF-16, plus a 128 KiB Linux limit on
+      # a single env string if the consumer passes the list that way (#21).
+      # Only relative paths cross this boundary, not the full build output
+      # that previously exhausted artifact storage. Retain them for one day
+      # and fail visibly if the artifact cannot be uploaded or downloaded.
+      # A hostile build can at most name keys inside its own preview prefix,
+      # exactly what the rebuilt `public/` could already do, so the security
+      # split above is unchanged.
       - name: Emit build file list
-        id: files
+        id: file-list
         shell: bash
         run: |
           set -euo pipefail
           list="${RUNNER_TEMP}/cleanup-files.txt"
           (cd public && find . -type f | sed 's#^\./##' | LC_ALL=C sort) > "${list}"
-          encoded=$(gzip -9c "${list}" | base64 -w0)
-          if [ "${#encoded}" -gt 900000 ]; then
-            echo "::error::Build file list is ${#encoded} bytes encoded — over the job-output limit, cannot hand it to cleanup"
-            exit 1
-          fi
-          echo "$(wc -l < "${list}") file(s) under public/ (${#encoded} bytes encoded)"
-          echo "files=${encoded}" >> "$GITHUB_OUTPUT"
+          digest=$(sha256sum "${list}")
+          echo "sha256=${digest%% *}" >> "$GITHUB_OUTPUT"
+          echo "$(wc -l < "${list}") file(s) under public/"
+      - name: Upload build file list
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: cleanup-files-${{ github.run_id }}
+          path: ${{ runner.temp }}/cleanup-files.txt
+          retention-days: 1
+          if-no-files-found: error
+          compression-level: 9
+          # A full re-run replaces the list; retrying only cleanup can still
+          # download the successful cleanup-build attempt's artifact by name.
+          overwrite: true
 
   cleanup:
     needs: cleanup-build
@@ -484,22 +494,41 @@ jobs:
           echo "api-base-url=${api_base_url}" >> "$GITHUB_OUTPUT"
           echo "oidc-audience=${oidc_audience}" >> "$GITHUB_OUTPUT"
 
-      # Taken from `cleanup-build`'s job output rather than rebuilt here — this
+      # Taken from `cleanup-build`'s artifact rather than rebuilt here — this
       # job holds `id-token: write`, so it must never run the site repo's own
       # code (Hugo templates, and especially an opt-in `npm ci`) itself. See
       # `cleanup-build`'s own comment above for why that split exists and why
-      # the handoff is a job output instead of `actions/cache`.
+      # the handoff is an artifact instead of `actions/cache`.
+      - name: Download build file list
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: cleanup-files-${{ github.run_id }}
+          path: ${{ runner.temp }}/cleanup-file-list
       - name: Materialise build file list
         env:
-          FILES_B64: ${{ needs.cleanup-build.outputs.files }}
+          EXPECTED_SHA256: ${{ needs.cleanup-build.outputs.file-list-sha256 }}
         run: |
           set -euo pipefail
-          if [ -z "${FILES_B64}" ]; then
-            echo "::error::cleanup-build handed over no file list — refusing to guess which preview keys to delete"
+          list="${RUNNER_TEMP}/cleanup-file-list/cleanup-files.txt"
+          if [ ! -f "${list}" ]; then
+            echo "::error::Build file list is missing from cleanup-build's artifact — refusing to guess which preview keys to delete"
             exit 1
           fi
-          printf '%s' "${FILES_B64}" | base64 -d | gunzip > "${RUNNER_TEMP}/cleanup-files.txt"
-          echo "$(wc -l < "${RUNNER_TEMP}/cleanup-files.txt") file(s) to delete"
+          # download-artifact only warns on digest mismatch; require our own
+          # file checksum before requesting OIDC or minting any credential.
+          if [[ ! "${EXPECTED_SHA256:-}" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::Build file list SHA-256 is missing or invalid — refusing to delete preview keys"
+            exit 1
+          fi
+          if ! digest=$(sha256sum "${list}"); then
+            echo "::error::Build file list SHA-256 could not be computed — refusing to delete preview keys"
+            exit 1
+          fi
+          if [ "${digest%% *}" != "${EXPECTED_SHA256}" ]; then
+            echo "::error::Build file list SHA-256 mismatch — refusing to delete preview keys"
+            exit 1
+          fi
+          echo "$(wc -l < "${list}") file(s) to delete"
 
       - name: Request GitHub OIDC token
         id: oidc
@@ -568,7 +597,7 @@ jobs:
           R2_ACCESS_KEY_ID: ${{ steps.mint.outputs.accessKeyId }}
           R2_SECRET_ACCESS_KEY: ${{ steps.mint.outputs.secretAccessKey }}
           R2_SESSION_TOKEN: ${{ steps.mint.outputs.sessionToken }}
-          FILE_LIST: ${{ runner.temp }}/cleanup-files.txt
+          FILE_LIST: ${{ runner.temp }}/cleanup-file-list/cleanup-files.txt
         run: node .site-actions/scripts/delete-from-r2.mjs
 
       - name: Remove preview hostname
